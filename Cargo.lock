@@ -404,12 +404,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "voxelize"
+name = "voxelaz"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
  "las",
+ "thiserror",
 ]
 
 [[package]]

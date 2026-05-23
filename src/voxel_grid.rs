@@ -1,4 +1,5 @@
-use anyhow::Result;
+use crate::Result;
+use crate::VoxelizeError;
 
 pub const CHUNK_SIZE: usize = 64;
 pub const BOUNDED_QUEUE_CAPACITY: usize = 64;
@@ -45,8 +46,10 @@ impl VoxelGrid {
         dimensions_meters: [f64; 3],
         voxel_size: f64,
         counts_as_intensity: bool,
-    ) -> Self {
-        assert!(voxel_size > 0.0);
+    ) -> Result<Self> {
+        if voxel_size <= 0.0 {
+            return Err(VoxelizeError::InvalidVoxelSize);
+        }
         let inverse_voxel_size = 1.0 / voxel_size;
         let grid_x = (dimensions_meters[0] * inverse_voxel_size).ceil() as u64;
         let grid_y = (dimensions_meters[1] * inverse_voxel_size).ceil() as u64;
@@ -69,7 +72,7 @@ impl VoxelGrid {
             * level2_children_per_axis
             * level2_children_per_axis) as usize;
         let leaf_len = (leaf_stride * leaf_stride * leaf_stride) as usize;
-        Self {
+        Ok(Self {
             roots: std::collections::HashMap::new(),
             origin_meters,
             dimensions_meters,
@@ -84,7 +87,7 @@ impl VoxelGrid {
             level1_len,
             level2_len,
             leaf_len,
-        }
+        })
     }
 
     pub fn insert(&mut self, x: f64, y: f64, z: f64) {

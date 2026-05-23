@@ -1,9 +1,24 @@
 [package]
-name = "voxelize"
+name = "voxelaz"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95.0"
+authors = ["Alexi Peck <alexinicolaspeck@gmail.com>"]
+description = "Voxelize LAS/LAZ point clouds into downsampled voxel centers"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/alexipeck/voxelize"
+homepage = "https://github.com/alexipeck/voxelize"
+documentation = "https://docs.rs/voxelaz"
+keywords = ["las", "laz", "lidar", "point-cloud", "voxel"]
+categories = ["command-line-utilities", "science"]
+
+[[bin]]
+name = "voxelize"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
 las = { version = "0.9.11", features = ["laz"] }
+thiserror = "2.0.18"

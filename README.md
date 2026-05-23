@@ -2,6 +2,8 @@
 
 Voxelize LAS/LAZ point clouds into a downsampled output where each point is a voxel center.
 
+Published on crates.io as [`voxelaz`](https://crates.io/crates/voxelaz).
+
 ## CLI
 
 ```text
@@ -17,14 +19,20 @@ voxelize --input <path> --output <path> --voxel-size <meters> [--counts-as-inten
 ## Library
 
 ```rust
-use voxelize::{ClassificationFilter, VoxelizeConfig};
+use voxelaz::{ClassificationFilter, VoxelizeConfig, VoxelizeError};
 
 let config = VoxelizeConfig {
     voxel_size: 0.5,
     classification_filter: ClassificationFilter::all(),
     counts_as_intensity: false,
 };
-voxelize::voxelize(input, output, &config)?;
+match voxelaz::voxelize(input, output, &config) {
+    Ok(()) => {}
+    Err(VoxelizeError::InvalidVoxelSize) => { /* ... */ }
+    Err(e) => return Err(e.into()),
+}
 ```
+
+Fallible APIs return `voxelaz::Result<T>` (`Result<T, VoxelizeError>`). LAS I/O failures surface as `VoxelizeError::Las`. The CLI binary still reports errors via `anyhow`; library callers can use `?` with `anyhow::Result` because `VoxelizeError` implements `std::error::Error`.
 
 `VoxelizeConfig::new(voxel_size)` sets `classification_filter` to all codes and `counts_as_intensity` to `false`.

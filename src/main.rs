@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use voxelize::{ClassificationFilter, VoxelizeConfig};
+use voxelaz::{ClassificationFilter, VoxelizeConfig};
 
 #[derive(Parser)]
 struct Cli {
@@ -26,5 +26,6 @@ fn main() -> anyhow::Result<()> {
     let mut config = VoxelizeConfig::new(cli.voxel_size);
     config.classification_filter = classification_filter;
     config.counts_as_intensity = cli.counts_as_intensity;
-    voxelize::voxelize(&cli.input, &cli.output, &config)
+    voxelaz::voxelize(&cli.input, &cli.output, &config)?;
+    Ok(())
 }

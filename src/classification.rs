@@ -1,5 +1,6 @@
-use anyhow::{bail, Result};
 use las::point::Classification;
+
+use crate::{Result, VoxelizeError};
 
 #[derive(Clone, Copy)]
 pub struct ClassificationFilter {
@@ -15,14 +16,14 @@ impl ClassificationFilter {
 
     pub fn from_codes(codes: &[u8]) -> Result<Self> {
         if codes.is_empty() {
-            bail!("at least one classification code is required");
+            return Err(VoxelizeError::EmptyClassificationCodes);
         }
 
         let mut allowed = [false; 256];
         for &code in codes {
-            Classification::new(code).map_err(|_| {
-                anyhow::anyhow!("invalid classification code: {code}")
-            })?;
+            if Classification::new(code).is_err() {
+                return Err(VoxelizeError::InvalidClassificationCode { code });
+            }
             allowed[code as usize] = true;
         }
 

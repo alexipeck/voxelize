@@ -1,16 +1,18 @@
 mod classification;
+mod error;
 mod pipeline;
 mod voxel_grid;
 
 pub use classification::ClassificationFilter;
+pub use error::{Result, VoxelizeError};
 pub use voxel_grid::{VoxelGrid, VoxelPoint, BOUNDED_QUEUE_CAPACITY, CHUNK_SIZE};
 
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Result};
 use las::point::Format;
 use las::{Color, Point};
 
+use error::{join_consumer, join_producer};
 use pipeline::run_pipeline;
 
 pub struct VoxelizeConfig {
@@ -31,11 +33,11 @@ impl VoxelizeConfig {
 
 pub fn voxelize(input: &Path, output: &Path, config: &VoxelizeConfig) -> Result<()> {
     if config.voxel_size <= 0.0 {
-        bail!("voxel_size must be greater than 0");
+        return Err(VoxelizeError::InvalidVoxelSize);
     }
 
     let header = {
-        let reader = las::Reader::from_path(input).map_err(anyhow::Error::from)?;
+        let reader = las::Reader::from_path(input)?;
         reader.header().clone()
     };
     let bounds = header.bounds();
@@ -57,12 +59,8 @@ pub fn voxelize(input: &Path, output: &Path, config: &VoxelizeConfig) -> Result<
         config.counts_as_intensity,
     );
 
-    consumer
-        .join()
-        .map_err(|_| anyhow!("consumer panicked"))??;
-    producer
-        .join()
-        .map_err(|_| anyhow!("producer panicked"))??;
+    join_consumer(consumer)?;
+    join_producer(producer)?;
 
     Ok(())
 }
