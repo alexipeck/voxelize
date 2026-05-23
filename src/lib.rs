@@ -9,7 +9,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Result};
 use las::point::Format;
-use las::{Color, Header, Point, Writer};
+use las::{Color, Point};
 
 use pipeline::run_pipeline;
 
@@ -23,8 +23,10 @@ pub fn voxelize(
         bail!("voxel_size must be greater than 0");
     }
 
-    let reader = las::Reader::from_path(input).map_err(anyhow::Error::from)?;
-    let header = reader.header().clone();
+    let header = {
+        let reader = las::Reader::from_path(input).map_err(anyhow::Error::from)?;
+        reader.header().clone()
+    };
     let bounds = header.bounds();
     let origin = [bounds.min.x, bounds.min.y, bounds.min.z];
     let dimensions = [
@@ -33,42 +35,32 @@ pub fn voxelize(
         bounds.max.z - bounds.min.z,
     ];
 
-    let (producer, consumer) =
-        run_pipeline(input, origin, dimensions, voxel_size, classification_filter);
+    let (producer, consumer) = run_pipeline(
+        input,
+        output.to_path_buf(),
+        header,
+        origin,
+        dimensions,
+        voxel_size,
+        classification_filter,
+    );
 
+    consumer
+        .join()
+        .map_err(|_| anyhow!("consumer panicked"))??;
     producer
         .join()
         .map_err(|_| anyhow!("producer panicked"))??;
-    let voxel_points = consumer
-        .join()
-        .map_err(|_| anyhow!("consumer panicked"))??;
-
-    write_output(output, header, &voxel_points)?;
 
     Ok(())
 }
 
-fn write_output(output: &Path, header: Header, voxel_points: &[VoxelPoint]) -> Result<()> {
-    let point_format = *header.point_format();
-    let mut writer = Writer::from_path(output, header).map_err(anyhow::Error::from)?;
-
-    for voxel_point in voxel_points {
-        let point = voxel_point_to_las_point(voxel_point, &point_format);
-        writer
-            .write_point(point)
-            .map_err(anyhow::Error::from)?;
-    }
-
-    writer.close().map_err(anyhow::Error::from)?;
-    Ok(())
-}
-
-fn voxel_point_to_las_point(voxel_point: &VoxelPoint, format: &Format) -> Point {
+pub(crate) fn voxel_point_to_las_point(voxel_point: &VoxelPoint, format: &Format) -> Point {
     let mut point = Point::default();
     point.x = voxel_point.x;
     point.y = voxel_point.y;
     point.z = voxel_point.z;
-    point.intensity = voxel_point.count.min(u16::MAX as u32) as u16;
+    point.intensity = voxel_point.count;
     if format.has_gps_time {
         point.gps_time = Some(0.0);
     }

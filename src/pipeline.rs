@@ -1,12 +1,13 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::JoinHandle;
 
 use anyhow::{anyhow, Result};
-use las::Point;
+use las::{Header, Point, Writer};
 
 use crate::classification::ClassificationFilter;
-use crate::voxel_grid::{VoxelGrid, VoxelPoint, BOUNDED_QUEUE_CAPACITY, CHUNK_SIZE};
+use crate::voxel_grid::{VoxelGrid, BOUNDED_QUEUE_CAPACITY, CHUNK_SIZE};
+use crate::voxel_point_to_las_point;
 
 struct PipelineChannels {
     a_tx: SyncSender<Vec<Point>>,
@@ -28,13 +29,15 @@ fn create_channels() -> PipelineChannels {
 
 pub fn run_pipeline(
     input: &Path,
+    output: PathBuf,
+    header: Header,
     origin: [f64; 3],
     dimensions: [f64; 3],
     voxel_size: f64,
     classification_filter: ClassificationFilter,
 ) -> (
     JoinHandle<Result<()>>,
-    JoinHandle<Result<Vec<VoxelPoint>>>,
+    JoinHandle<Result<()>>,
 ) {
     let input = input.to_path_buf();
     let channels = create_channels();
@@ -47,6 +50,8 @@ pub fn run_pipeline(
         run_consumer(
             channels.a_rx,
             channels.b_tx,
+            output,
+            header,
             origin,
             dimensions,
             voxel_size,
@@ -103,11 +108,13 @@ fn run_producer(
 fn run_consumer(
     a_rx: Receiver<Vec<Point>>,
     b_tx: mpsc::Sender<Vec<Point>>,
+    output: PathBuf,
+    header: Header,
     origin: [f64; 3],
     dimensions: [f64; 3],
     voxel_size: f64,
     classification_filter: ClassificationFilter,
-) -> Result<Vec<VoxelPoint>> {
+) -> Result<()> {
     let mut grid = VoxelGrid::new(origin, dimensions, voxel_size);
 
     while let Ok(buffer) = a_rx.recv() {
@@ -120,5 +127,15 @@ fn run_consumer(
     }
 
     drop(b_tx);
-    Ok(grid.export())
+
+    let point_format = *header.point_format();
+    let mut writer = Writer::from_path(&output, header).map_err(anyhow::Error::from)?;
+    grid.drain(|voxel_point| {
+        let point = voxel_point_to_las_point(&voxel_point, &point_format);
+        writer
+            .write_point(point)
+            .map_err(anyhow::Error::from)
+    })?;
+    writer.close().map_err(anyhow::Error::from)?;
+    Ok(())
 }

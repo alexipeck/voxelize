@@ -1,3 +1,5 @@
+use anyhow::Result;
+
 pub const CHUNK_SIZE: usize = 64;
 pub const BOUNDED_QUEUE_CAPACITY: usize = 64;
 
@@ -5,11 +7,21 @@ pub struct VoxelPoint {
     pub x: f64,
     pub y: f64,
     pub z: f64,
-    pub count: u32,
+    pub count: u16,
 }
 
+enum Leaf {
+    Sparse(Vec<(u16, u16)>),
+    Dense(Box<[u16]>),
+}
+
+type Level2Slot = Option<Box<Leaf>>;
+type Level1Array = Box<[Level2Slot]>;
+type Level1Slot = Option<Level1Array>;
+type RootLevel1 = Box<[Level1Slot]>;
+
 pub struct VoxelGrid {
-    pub roots: std::collections::HashMap<(i64, i64, i64), Box<[Option<Box<[Option<Box<[u32]>>]>>]>>,
+    roots: std::collections::HashMap<(i64, i64, i64), RootLevel1>,
     pub origin_meters: [f64; 3],
     pub dimensions_meters: [f64; 3],
     pub voxel_size: f64,
@@ -102,74 +114,130 @@ impl VoxelGrid {
             .or_insert_with(|| Self::new_level1_array(level1_len));
         let level2_array =
             level1_array[level1_index].get_or_insert_with(|| Self::new_level2_array(level2_len));
-        let counts =
-            level2_array[level2_index].get_or_insert_with(|| Self::new_leaf_array(leaf_len));
-        counts[voxel_index] = counts[voxel_index].wrapping_add(1);
+        let leaf = level2_array[level2_index].get_or_insert_with(Self::new_sparse_leaf);
+        Self::leaf_insert(leaf, voxel_index, leaf_len);
     }
 
-    pub fn export(&self) -> Vec<VoxelPoint> {
-        let mut points = Vec::new();
-        for (&(root_x, root_y, root_z), level1_array) in &self.roots {
+    pub fn drain<F>(mut self, mut visit: F) -> Result<()>
+    where
+        F: FnMut(VoxelPoint) -> Result<()>,
+    {
+        let origin_meters = self.origin_meters;
+        let voxel_size = self.voxel_size;
+        let top_stride = self.top_stride;
+        let middle_stride = self.middle_stride;
+        let leaf_stride = self.leaf_stride;
+        let level1_children_per_axis = self.level1_children_per_axis;
+        let level2_children_per_axis = self.level2_children_per_axis;
+
+        for ((root_x, root_y, root_z), mut level1_array) in self.roots.drain() {
             for level1_index in 0..level1_array.len() {
-                let Some(level2_array) = &level1_array[level1_index] else {
+                let Some(mut level2_array) = std::mem::take(&mut level1_array[level1_index]) else {
                     continue;
                 };
                 let (level1_x, level1_y, level1_z) =
-                    Self::decode_index(level1_index, self.level1_children_per_axis);
+                    Self::decode_index(level1_index, level1_children_per_axis);
                 for level2_index in 0..level2_array.len() {
-                    let Some(counts) = &level2_array[level2_index] else {
+                    let Some(leaf) = std::mem::take(&mut level2_array[level2_index]) else {
                         continue;
                     };
                     let (level2_x, level2_y, level2_z) =
-                        Self::decode_index(level2_index, self.level2_children_per_axis);
-                    for voxel_index in 0..counts.len() {
-                        let count = counts[voxel_index];
+                        Self::decode_index(level2_index, level2_children_per_axis);
+                    let mut emit = |voxel_index: usize, count: u16| -> Result<()> {
                         if count == 0 {
-                            continue;
+                            return Ok(());
                         }
                         let (local_x, local_y, local_z) =
-                            Self::decode_index(voxel_index, self.leaf_stride);
-                        let voxel_x = root_x * self.top_stride
-                            + level1_x * self.middle_stride
-                            + level2_x * self.leaf_stride
+                            Self::decode_index(voxel_index, leaf_stride);
+                        let voxel_x = root_x * top_stride
+                            + level1_x * middle_stride
+                            + level2_x * leaf_stride
                             + local_x;
-                        let voxel_y = root_y * self.top_stride
-                            + level1_y * self.middle_stride
-                            + level2_y * self.leaf_stride
+                        let voxel_y = root_y * top_stride
+                            + level1_y * middle_stride
+                            + level2_y * leaf_stride
                             + local_y;
-                        let voxel_z = root_z * self.top_stride
-                            + level1_z * self.middle_stride
-                            + level2_z * self.leaf_stride
+                        let voxel_z = root_z * top_stride
+                            + level1_z * middle_stride
+                            + level2_z * leaf_stride
                             + local_z;
-                        points.push(VoxelPoint {
-                            x: self.origin_meters[0] + (voxel_x as f64 + 0.5) * self.voxel_size,
-                            y: self.origin_meters[1] + (voxel_y as f64 + 0.5) * self.voxel_size,
-                            z: self.origin_meters[2] + (voxel_z as f64 + 0.5) * self.voxel_size,
+                        visit(VoxelPoint {
+                            x: origin_meters[0] + (voxel_x as f64 + 0.5) * voxel_size,
+                            y: origin_meters[1] + (voxel_y as f64 + 0.5) * voxel_size,
+                            z: origin_meters[2] + (voxel_z as f64 + 0.5) * voxel_size,
                             count,
-                        });
+                        })
+                    };
+                    match *leaf {
+                        Leaf::Sparse(entries) => {
+                            for &(idx, count) in &entries {
+                                emit(idx as usize, count)?;
+                            }
+                        }
+                        Leaf::Dense(counts) => {
+                            for voxel_index in 0..counts.len() {
+                                emit(voxel_index, counts[voxel_index])?;
+                            }
+                        }
                     }
                 }
             }
         }
-        points
+        Ok(())
     }
 
-    fn new_level1_array(len: usize) -> Box<[Option<Box<[Option<Box<[u32]>>]>>]> {
+    fn leaf_insert(leaf: &mut Leaf, voxel_index: usize, leaf_len: usize) {
+        match leaf {
+            Leaf::Dense(counts) => {
+                Self::bump_count(&mut counts[voxel_index]);
+            }
+            Leaf::Sparse(entries) => {
+                let idx = voxel_index as u16;
+                for entry in entries.iter_mut() {
+                    if entry.0 == idx {
+                        Self::bump_count(&mut entry.1);
+                        return;
+                    }
+                }
+                if entries.len() + 1 >= Self::dense_promote_at(leaf_len) {
+                    let mut dense = Self::sparse_to_dense(entries, leaf_len);
+                    Self::bump_count(&mut dense[voxel_index]);
+                    *leaf = Leaf::Dense(dense);
+                    return;
+                }
+                entries.push((idx, 1));
+            }
+        }
+    }
+
+    fn new_sparse_leaf() -> Box<Leaf> {
+        Box::new(Leaf::Sparse(Vec::with_capacity(4)))
+    }
+
+    fn sparse_to_dense(entries: &[(u16, u16)], leaf_len: usize) -> Box<[u16]> {
+        let mut dense = vec![0u16; leaf_len];
+        for &(idx, count) in entries {
+            dense[idx as usize] = count;
+        }
+        dense.into_boxed_slice()
+    }
+
+    fn dense_promote_at(leaf_len: usize) -> usize {
+        (leaf_len / 4).max(128)
+    }
+
+    fn new_level1_array(len: usize) -> RootLevel1 {
         std::iter::repeat_with(|| None)
             .take(len)
             .collect::<Vec<_>>()
             .into_boxed_slice()
     }
 
-    fn new_level2_array(len: usize) -> Box<[Option<Box<[u32]>>]> {
+    fn new_level2_array(len: usize) -> Level1Array {
         std::iter::repeat_with(|| None)
             .take(len)
             .collect::<Vec<_>>()
             .into_boxed_slice()
-    }
-
-    fn new_leaf_array(len: usize) -> Box<[u32]> {
-        vec![0u32; len].into_boxed_slice()
     }
 
     fn linear_index(x: i64, y: i64, z: i64, width: i64) -> usize {
@@ -182,6 +250,10 @@ impl VoxelGrid {
         let y = (index / width) % width;
         let z = index / (width * width);
         (x, y, z)
+    }
+
+    fn bump_count(slot: &mut u16) {
+        *slot = slot.saturating_add(1);
     }
 
     fn div_floor(a: i64, b: i64) -> i64 {
