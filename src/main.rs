@@ -1,16 +1,20 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use voxelize::ClassificationFilter;
+use voxelize::{ClassificationFilter, VoxelizeConfig};
 
 #[derive(Parser)]
 struct Cli {
+    #[arg(long)]
     input: PathBuf,
+    #[arg(long)]
     output: PathBuf,
     #[arg(long)]
     voxel_size: f64,
     #[arg(long, value_delimiter = ',')]
     include_classification: Option<Vec<u8>>,
+    #[arg(long, default_value_t = false)]
+    counts_as_intensity: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -19,10 +23,8 @@ fn main() -> anyhow::Result<()> {
         None => ClassificationFilter::all(),
         Some(codes) => ClassificationFilter::from_codes(&codes)?,
     };
-    voxelize::voxelize(
-        &cli.input,
-        &cli.output,
-        cli.voxel_size,
-        classification_filter,
-    )
+    let mut config = VoxelizeConfig::new(cli.voxel_size);
+    config.classification_filter = classification_filter;
+    config.counts_as_intensity = cli.counts_as_intensity;
+    voxelize::voxelize(&cli.input, &cli.output, &config)
 }

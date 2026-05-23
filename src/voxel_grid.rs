@@ -11,8 +11,10 @@ pub struct VoxelPoint {
 }
 
 enum Leaf {
-    Sparse(Vec<(u16, u16)>),
-    Dense(Box<[u16]>),
+    SparseCount(Vec<(u16, u16)>),
+    SparsePresence(Vec<u16>),
+    DenseCount(Box<[u16]>),
+    DensePresence(Box<[u64]>),
 }
 
 type Level2Slot = Option<Box<Leaf>>;
@@ -26,6 +28,7 @@ pub struct VoxelGrid {
     pub dimensions_meters: [f64; 3],
     pub voxel_size: f64,
     pub inverse_voxel_size: f64,
+    counts_as_intensity: bool,
     top_stride: i64,
     middle_stride: i64,
     leaf_stride: i64,
@@ -37,7 +40,12 @@ pub struct VoxelGrid {
 }
 
 impl VoxelGrid {
-    pub fn new(origin_meters: [f64; 3], dimensions_meters: [f64; 3], voxel_size: f64) -> Self {
+    pub fn new(
+        origin_meters: [f64; 3],
+        dimensions_meters: [f64; 3],
+        voxel_size: f64,
+        counts_as_intensity: bool,
+    ) -> Self {
         assert!(voxel_size > 0.0);
         let inverse_voxel_size = 1.0 / voxel_size;
         let grid_x = (dimensions_meters[0] * inverse_voxel_size).ceil() as u64;
@@ -67,6 +75,7 @@ impl VoxelGrid {
             dimensions_meters,
             voxel_size,
             inverse_voxel_size,
+            counts_as_intensity,
             top_stride,
             middle_stride,
             leaf_stride,
@@ -108,14 +117,16 @@ impl VoxelGrid {
         let level1_len = self.level1_len;
         let level2_len = self.level2_len;
         let leaf_len = self.leaf_len;
+        let counts_as_intensity = self.counts_as_intensity;
         let level1_array = self
             .roots
             .entry((root_x, root_y, root_z))
             .or_insert_with(|| Self::new_level1_array(level1_len));
         let level2_array =
             level1_array[level1_index].get_or_insert_with(|| Self::new_level2_array(level2_len));
-        let leaf = level2_array[level2_index].get_or_insert_with(Self::new_sparse_leaf);
-        Self::leaf_insert(leaf, voxel_index, leaf_len);
+        let leaf = level2_array[level2_index]
+            .get_or_insert_with(|| Self::new_sparse_leaf(counts_as_intensity));
+        Self::leaf_insert(leaf, voxel_index, leaf_len, counts_as_intensity);
     }
 
     pub fn drain<F>(mut self, mut visit: F) -> Result<()>
@@ -129,6 +140,7 @@ impl VoxelGrid {
         let leaf_stride = self.leaf_stride;
         let level1_children_per_axis = self.level1_children_per_axis;
         let level2_children_per_axis = self.level2_children_per_axis;
+        let counts_as_intensity = self.counts_as_intensity;
 
         for ((root_x, root_y, root_z), mut level1_array) in self.roots.drain() {
             for level1_index in 0..level1_array.len() {
@@ -144,7 +156,7 @@ impl VoxelGrid {
                     let (level2_x, level2_y, level2_z) =
                         Self::decode_index(level2_index, level2_children_per_axis);
                     let mut emit = |voxel_index: usize, count: u16| -> Result<()> {
-                        if count == 0 {
+                        if counts_as_intensity && count == 0 {
                             return Ok(());
                         }
                         let (local_x, local_y, local_z) =
@@ -165,18 +177,34 @@ impl VoxelGrid {
                             x: origin_meters[0] + (voxel_x as f64 + 0.5) * voxel_size,
                             y: origin_meters[1] + (voxel_y as f64 + 0.5) * voxel_size,
                             z: origin_meters[2] + (voxel_z as f64 + 0.5) * voxel_size,
-                            count,
+                            count: if counts_as_intensity { count } else { 1 },
                         })
                     };
                     match *leaf {
-                        Leaf::Sparse(entries) => {
+                        Leaf::SparseCount(entries) => {
                             for &(idx, count) in &entries {
                                 emit(idx as usize, count)?;
                             }
                         }
-                        Leaf::Dense(counts) => {
+                        Leaf::SparsePresence(indices) => {
+                            for &idx in &indices {
+                                emit(idx as usize, 1)?;
+                            }
+                        }
+                        Leaf::DenseCount(counts) => {
                             for voxel_index in 0..counts.len() {
                                 emit(voxel_index, counts[voxel_index])?;
+                            }
+                        }
+                        Leaf::DensePresence(bits) => {
+                            for (word_index, word) in bits.iter().enumerate() {
+                                let mut word = *word;
+                                while word != 0 {
+                                    let bit = word.trailing_zeros() as usize;
+                                    let voxel_index = word_index * 64 + bit;
+                                    emit(voxel_index, 1)?;
+                                    word &= word - 1;
+                                }
                             }
                         }
                     }
@@ -186,12 +214,20 @@ impl VoxelGrid {
         Ok(())
     }
 
-    fn leaf_insert(leaf: &mut Leaf, voxel_index: usize, leaf_len: usize) {
+    fn leaf_insert(leaf: &mut Leaf, voxel_index: usize, leaf_len: usize, counts_as_intensity: bool) {
+        if counts_as_intensity {
+            Self::leaf_insert_count(leaf, voxel_index, leaf_len);
+        } else {
+            Self::leaf_insert_presence(leaf, voxel_index, leaf_len);
+        }
+    }
+
+    fn leaf_insert_count(leaf: &mut Leaf, voxel_index: usize, leaf_len: usize) {
         match leaf {
-            Leaf::Dense(counts) => {
+            Leaf::DenseCount(counts) => {
                 Self::bump_count(&mut counts[voxel_index]);
             }
-            Leaf::Sparse(entries) => {
+            Leaf::SparseCount(entries) => {
                 let idx = voxel_index as u16;
                 for entry in entries.iter_mut() {
                     if entry.0 == idx {
@@ -200,26 +236,77 @@ impl VoxelGrid {
                     }
                 }
                 if entries.len() + 1 >= Self::dense_promote_at(leaf_len) {
-                    let mut dense = Self::sparse_to_dense(entries, leaf_len);
+                    let mut dense = Self::sparse_count_to_dense(entries, leaf_len);
                     Self::bump_count(&mut dense[voxel_index]);
-                    *leaf = Leaf::Dense(dense);
+                    *leaf = Leaf::DenseCount(dense);
                     return;
                 }
                 entries.push((idx, 1));
             }
+            _ => unreachable!(),
         }
     }
 
-    fn new_sparse_leaf() -> Box<Leaf> {
-        Box::new(Leaf::Sparse(Vec::with_capacity(4)))
+    fn leaf_insert_presence(leaf: &mut Leaf, voxel_index: usize, leaf_len: usize) {
+        match leaf {
+            Leaf::DensePresence(bits) => {
+                if Self::test_bit(bits, voxel_index) {
+                    return;
+                }
+                Self::set_bit(bits, voxel_index);
+            }
+            Leaf::SparsePresence(indices) => {
+                let idx = voxel_index as u16;
+                for &existing in indices.iter() {
+                    if existing == idx {
+                        return;
+                    }
+                }
+                if indices.len() + 1 >= Self::dense_promote_at(leaf_len) {
+                    let dense = Self::sparse_presence_to_dense(indices, leaf_len);
+                    *leaf = Leaf::DensePresence(dense);
+                    if let Leaf::DensePresence(bits) = leaf {
+                        Self::set_bit(bits, voxel_index);
+                    }
+                    return;
+                }
+                indices.push(idx);
+            }
+            _ => unreachable!(),
+        }
     }
 
-    fn sparse_to_dense(entries: &[(u16, u16)], leaf_len: usize) -> Box<[u16]> {
+    fn new_sparse_leaf(counts_as_intensity: bool) -> Box<Leaf> {
+        if counts_as_intensity {
+            Box::new(Leaf::SparseCount(Vec::with_capacity(4)))
+        } else {
+            Box::new(Leaf::SparsePresence(Vec::with_capacity(4)))
+        }
+    }
+
+    fn sparse_count_to_dense(entries: &[(u16, u16)], leaf_len: usize) -> Box<[u16]> {
         let mut dense = vec![0u16; leaf_len];
         for &(idx, count) in entries {
             dense[idx as usize] = count;
         }
         dense.into_boxed_slice()
+    }
+
+    fn sparse_presence_to_dense(indices: &[u16], leaf_len: usize) -> Box<[u64]> {
+        let word_count = leaf_len.div_ceil(64);
+        let mut bits = vec![0u64; word_count];
+        for &idx in indices {
+            Self::set_bit(&mut bits, idx as usize);
+        }
+        bits.into_boxed_slice()
+    }
+
+    fn set_bit(bits: &mut [u64], index: usize) {
+        bits[index / 64] |= 1u64 << (index % 64);
+    }
+
+    fn test_bit(bits: &[u64], index: usize) -> bool {
+        (bits[index / 64] & (1u64 << (index % 64))) != 0
     }
 
     fn dense_promote_at(leaf_len: usize) -> usize {

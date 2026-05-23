@@ -13,13 +13,24 @@ use las::{Color, Point};
 
 use pipeline::run_pipeline;
 
-pub fn voxelize(
-    input: &Path,
-    output: &Path,
-    voxel_size: f64,
-    classification_filter: ClassificationFilter,
-) -> Result<()> {
-    if voxel_size <= 0.0 {
+pub struct VoxelizeConfig {
+    pub voxel_size: f64,
+    pub classification_filter: ClassificationFilter,
+    pub counts_as_intensity: bool,
+}
+
+impl VoxelizeConfig {
+    pub fn new(voxel_size: f64) -> Self {
+        Self {
+            voxel_size,
+            classification_filter: ClassificationFilter::all(),
+            counts_as_intensity: false,
+        }
+    }
+}
+
+pub fn voxelize(input: &Path, output: &Path, config: &VoxelizeConfig) -> Result<()> {
+    if config.voxel_size <= 0.0 {
         bail!("voxel_size must be greater than 0");
     }
 
@@ -41,8 +52,9 @@ pub fn voxelize(
         header,
         origin,
         dimensions,
-        voxel_size,
-        classification_filter,
+        config.voxel_size,
+        config.classification_filter.clone(),
+        config.counts_as_intensity,
     );
 
     consumer
@@ -55,12 +67,18 @@ pub fn voxelize(
     Ok(())
 }
 
-pub(crate) fn voxel_point_to_las_point(voxel_point: &VoxelPoint, format: &Format) -> Point {
+pub(crate) fn voxel_point_to_las_point(
+    voxel_point: &VoxelPoint,
+    format: &Format,
+    counts_as_intensity: bool,
+) -> Point {
     let mut point = Point::default();
     point.x = voxel_point.x;
     point.y = voxel_point.y;
     point.z = voxel_point.z;
-    point.intensity = voxel_point.count;
+    if counts_as_intensity {
+        point.intensity = voxel_point.count;
+    }
     if format.has_gps_time {
         point.gps_time = Some(0.0);
     }

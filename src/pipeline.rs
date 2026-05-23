@@ -35,6 +35,7 @@ pub fn run_pipeline(
     dimensions: [f64; 3],
     voxel_size: f64,
     classification_filter: ClassificationFilter,
+    counts_as_intensity: bool,
 ) -> (
     JoinHandle<Result<()>>,
     JoinHandle<Result<()>>,
@@ -56,6 +57,7 @@ pub fn run_pipeline(
             dimensions,
             voxel_size,
             classification_filter,
+            counts_as_intensity,
         )
     });
 
@@ -114,8 +116,9 @@ fn run_consumer(
     dimensions: [f64; 3],
     voxel_size: f64,
     classification_filter: ClassificationFilter,
+    counts_as_intensity: bool,
 ) -> Result<()> {
-    let mut grid = VoxelGrid::new(origin, dimensions, voxel_size);
+    let mut grid = VoxelGrid::new(origin, dimensions, voxel_size, counts_as_intensity);
 
     while let Ok(buffer) = a_rx.recv() {
         for point in &buffer {
@@ -131,7 +134,7 @@ fn run_consumer(
     let point_format = *header.point_format();
     let mut writer = Writer::from_path(&output, header).map_err(anyhow::Error::from)?;
     grid.drain(|voxel_point| {
-        let point = voxel_point_to_las_point(&voxel_point, &point_format);
+        let point = voxel_point_to_las_point(&voxel_point, &point_format, counts_as_intensity);
         writer
             .write_point(point)
             .map_err(anyhow::Error::from)
