@@ -1,6 +1,8 @@
+mod classification;
 mod pipeline;
 mod voxel_grid;
 
+pub use classification::ClassificationFilter;
 pub use voxel_grid::{VoxelGrid, VoxelPoint, BOUNDED_QUEUE_CAPACITY, CHUNK_SIZE};
 
 use std::path::Path;
@@ -11,7 +13,12 @@ use las::{Color, Header, Point, Writer};
 
 use pipeline::run_pipeline;
 
-pub fn voxelize(input: &Path, output: &Path, voxel_size: f64) -> Result<()> {
+pub fn voxelize(
+    input: &Path,
+    output: &Path,
+    voxel_size: f64,
+    classification_filter: ClassificationFilter,
+) -> Result<()> {
     if voxel_size <= 0.0 {
         bail!("voxel_size must be greater than 0");
     }
@@ -26,7 +33,8 @@ pub fn voxelize(input: &Path, output: &Path, voxel_size: f64) -> Result<()> {
         bounds.max.z - bounds.min.z,
     ];
 
-    let (producer, consumer) = run_pipeline(input, origin, dimensions, voxel_size);
+    let (producer, consumer) =
+        run_pipeline(input, origin, dimensions, voxel_size, classification_filter);
 
     producer
         .join()

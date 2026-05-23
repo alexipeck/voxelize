@@ -5,6 +5,7 @@ use std::thread::JoinHandle;
 use anyhow::{anyhow, Result};
 use las::Point;
 
+use crate::classification::ClassificationFilter;
 use crate::voxel_grid::{VoxelGrid, VoxelPoint, BOUNDED_QUEUE_CAPACITY, CHUNK_SIZE};
 
 struct PipelineChannels {
@@ -30,6 +31,7 @@ pub fn run_pipeline(
     origin: [f64; 3],
     dimensions: [f64; 3],
     voxel_size: f64,
+    classification_filter: ClassificationFilter,
 ) -> (
     JoinHandle<Result<()>>,
     JoinHandle<Result<Vec<VoxelPoint>>>,
@@ -48,6 +50,7 @@ pub fn run_pipeline(
             origin,
             dimensions,
             voxel_size,
+            classification_filter,
         )
     });
 
@@ -103,12 +106,15 @@ fn run_consumer(
     origin: [f64; 3],
     dimensions: [f64; 3],
     voxel_size: f64,
+    classification_filter: ClassificationFilter,
 ) -> Result<Vec<VoxelPoint>> {
     let mut grid = VoxelGrid::new(origin, dimensions, voxel_size);
 
     while let Ok(buffer) = a_rx.recv() {
         for point in &buffer {
-            grid.insert(point.x, point.y, point.z);
+            if classification_filter.allows(point.classification) {
+                grid.insert(point.x, point.y, point.z);
+            }
         }
         let _ = b_tx.send(buffer);
     }
