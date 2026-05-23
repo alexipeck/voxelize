@@ -28,6 +28,9 @@ pub enum VoxelizeError {
 
     #[error("producer thread panicked")]
     ProducerPanicked,
+
+    #[error("operation cancelled")]
+    Cancelled,
 }
 
 pub(crate) fn join_consumer(handle: std::thread::JoinHandle<Result<()>>) -> Result<()> {

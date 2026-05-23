@@ -1,6 +1,6 @@
 [package]
 name = "voxelaz"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95.0"
 authors = ["Alexi Peck <alexinicolaspeck@gmail.com>"]
@@ -22,3 +22,4 @@ anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
 las = { version = "0.9.11", features = ["laz"] }
 thiserror = "2.0.18"
+ctrlc = "3.5.1"

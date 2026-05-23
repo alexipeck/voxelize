@@ -1,7 +1,7 @@
+use std::io::Write;
 use std::path::PathBuf;
-
 use clap::Parser;
-use voxelaz::{ClassificationFilter, VoxelizeConfig};
+use voxelaz::{CancellationToken, ClassificationFilter, VoxelizeConfig, VoxelizeError};
 
 #[derive(Parser)]
 struct Cli {
@@ -23,9 +23,22 @@ fn main() -> anyhow::Result<()> {
         None => ClassificationFilter::all(),
         Some(codes) => ClassificationFilter::from_codes(&codes)?,
     };
+    let cancel = CancellationToken::new();
+    let cancel_for_handler = cancel.clone();
+    ctrlc::set_handler(move || cancel_for_handler.cancel())
+        .expect("failed to install Ctrl-C handler");
     let mut config = VoxelizeConfig::new(cli.voxel_size);
     config.classification_filter = classification_filter;
     config.counts_as_intensity = cli.counts_as_intensity;
-    voxelaz::voxelize(&cli.input, &cli.output, &config)?;
-    Ok(())
+    config.cancel = Some(cancel);
+    match voxelaz::voxelize(&cli.input, &cli.output, &config) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if matches!(err, VoxelizeError::Cancelled) {
+                let _ = writeln!(std::io::stderr(), "cancelled");
+                std::process::exit(130);
+            }
+            Err(err.into())
+        }
+    }
 }

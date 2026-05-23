@@ -1,8 +1,10 @@
+mod cancel;
 mod classification;
 mod error;
 mod pipeline;
 mod voxel_grid;
 
+pub use cancel::CancellationToken;
 pub use classification::ClassificationFilter;
 pub use error::{Result, VoxelizeError};
 pub use voxel_grid::{VoxelGrid, VoxelPoint, BOUNDED_QUEUE_CAPACITY, CHUNK_SIZE};
@@ -19,6 +21,7 @@ pub struct VoxelizeConfig {
     pub voxel_size: f64,
     pub classification_filter: ClassificationFilter,
     pub counts_as_intensity: bool,
+    pub cancel: Option<CancellationToken>,
 }
 
 impl VoxelizeConfig {
@@ -27,6 +30,7 @@ impl VoxelizeConfig {
             voxel_size,
             classification_filter: ClassificationFilter::all(),
             counts_as_intensity: false,
+            cancel: None,
         }
     }
 }
@@ -57,10 +61,24 @@ pub fn voxelize(input: &Path, output: &Path, config: &VoxelizeConfig) -> Result<
         config.voxel_size,
         config.classification_filter.clone(),
         config.counts_as_intensity,
+        config.cancel.clone(),
     );
 
-    join_consumer(consumer)?;
-    join_producer(producer)?;
+    let consumer_result = join_consumer(consumer);
+    let producer_result = join_producer(producer);
+
+    let cancelled = matches!(
+        (&consumer_result, &producer_result),
+        (Err(VoxelizeError::Cancelled), _) | (_, Err(VoxelizeError::Cancelled))
+    );
+
+    if cancelled {
+        let _ = std::fs::remove_file(output);
+        return Err(VoxelizeError::Cancelled);
+    }
+
+    consumer_result?;
+    producer_result?;
 
     Ok(())
 }

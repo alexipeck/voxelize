@@ -4,10 +4,13 @@ use std::thread::JoinHandle;
 
 use las::{Header, Point, Writer};
 
+use crate::cancel::CancellationToken;
 use crate::classification::ClassificationFilter;
 use crate::voxel_grid::{VoxelGrid, BOUNDED_QUEUE_CAPACITY, CHUNK_SIZE};
 use crate::voxel_point_to_las_point;
 use crate::{Result, VoxelizeError};
+
+const DRAIN_CANCEL_CHECK_INTERVAL: usize = 4096;
 
 struct PipelineChannels {
     a_tx: SyncSender<Vec<Point>>,
@@ -27,6 +30,10 @@ fn create_channels() -> PipelineChannels {
     }
 }
 
+fn is_cancelled(cancel: &Option<CancellationToken>) -> bool {
+    cancel.as_ref().is_some_and(|t| t.is_cancelled())
+}
+
 pub fn run_pipeline(
     input: &Path,
     output: PathBuf,
@@ -36,6 +43,7 @@ pub fn run_pipeline(
     voxel_size: f64,
     classification_filter: ClassificationFilter,
     counts_as_intensity: bool,
+    cancel: Option<CancellationToken>,
 ) -> (
     JoinHandle<Result<()>>,
     JoinHandle<Result<()>>,
@@ -43,10 +51,12 @@ pub fn run_pipeline(
     let input = input.to_path_buf();
     let channels = create_channels();
 
+    let producer_cancel = cancel.clone();
     let producer = std::thread::spawn(move || {
-        run_producer(&input, channels.a_tx, channels.b_rx)
+        run_producer(&input, channels.a_tx, channels.b_rx, producer_cancel)
     });
 
+    let consumer_cancel = cancel;
     let consumer = std::thread::spawn(move || {
         run_consumer(
             channels.a_rx,
@@ -58,6 +68,7 @@ pub fn run_pipeline(
             voxel_size,
             classification_filter,
             counts_as_intensity,
+            consumer_cancel,
         )
     });
 
@@ -68,10 +79,17 @@ fn run_producer(
     input: &Path,
     a_tx: SyncSender<Vec<Point>>,
     b_rx: Receiver<Vec<Point>>,
+    cancel: Option<CancellationToken>,
 ) -> Result<()> {
     let mut reader = las::Reader::from_path(input)?;
 
     loop {
+        if is_cancelled(&cancel) {
+            drop(a_tx);
+            while b_rx.recv().is_ok() {}
+            return Err(VoxelizeError::Cancelled);
+        }
+
         let mut buffer = match b_rx.try_recv() {
             Ok(mut buf) => {
                 buf.clear();
@@ -115,10 +133,16 @@ fn run_consumer(
     voxel_size: f64,
     classification_filter: ClassificationFilter,
     counts_as_intensity: bool,
+    cancel: Option<CancellationToken>,
 ) -> Result<()> {
     let mut grid = VoxelGrid::new(origin, dimensions, voxel_size, counts_as_intensity)?;
 
     while let Ok(buffer) = a_rx.recv() {
+        if is_cancelled(&cancel) {
+            drop(b_tx);
+            return Err(VoxelizeError::Cancelled);
+        }
+
         for point in &buffer {
             if classification_filter.allows(point.classification) {
                 grid.insert(point.x, point.y, point.z);
@@ -129,12 +153,29 @@ fn run_consumer(
 
     drop(b_tx);
 
+    if is_cancelled(&cancel) {
+        return Err(VoxelizeError::Cancelled);
+    }
+
     let point_format = *header.point_format();
     let mut writer = Writer::from_path(&output, header)?;
-    grid.drain(|voxel_point| {
+    let mut emitted = 0usize;
+    let drain_result = grid.drain(|voxel_point| {
+        emitted += 1;
+        if emitted % DRAIN_CANCEL_CHECK_INTERVAL == 0 && is_cancelled(&cancel) {
+            return Err(VoxelizeError::Cancelled);
+        }
         let point = voxel_point_to_las_point(&voxel_point, &point_format, counts_as_intensity);
         writer.write_point(point).map_err(VoxelizeError::from)
-    })?;
+    });
+
+    if matches!(drain_result, Err(VoxelizeError::Cancelled)) {
+        drop(writer);
+        let _ = std::fs::remove_file(&output);
+        return Err(VoxelizeError::Cancelled);
+    }
+
+    drain_result?;
     writer.close()?;
     Ok(())
 }
