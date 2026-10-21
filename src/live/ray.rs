@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use super::config::RaySceneConfig;
-use super::dda::{RayCellRole, cell_upper_bound, visit_ray};
+use super::dda::{GridRay, RayCellRole, walk};
 use super::error::LiveError;
 use super::geometry::{VoxelGeometry, chunk_and_local};
 use super::model::RayUpdateModel;
@@ -145,21 +145,14 @@ impl<M: RayUpdateModel, const SIDE: usize> RaySceneWriter<M, SIDE> {
                 }
             }
         }
-        let source_key = match self.geometry.voxel_key(ray.source) {
-            Ok(key) => key,
+        let grid = match GridRay::new(&self.geometry, ray.source, ray.hit) {
+            Ok(grid) => grid,
             Err(_) => {
                 stats.invalid += 1;
                 return Ok(());
             }
         };
-        let hit_key = match self.geometry.voxel_key(ray.hit) {
-            Ok(key) => key,
-            Err(_) => {
-                stats.invalid += 1;
-                return Ok(());
-            }
-        };
-        let upper = cell_upper_bound(source_key, hit_key);
+        let upper = grid.cell_upper_bound();
         if upper > u128::from(self.cell_cap) {
             stats.capacity_rejected += 1;
             return Ok(());
@@ -167,7 +160,7 @@ impl<M: RayUpdateModel, const SIDE: usize> RaySceneWriter<M, SIDE> {
         if let Some(max_chunks) = self.max_chunks
             && self.store.chunk_count() as u128 + upper > u128::from(max_chunks)
         {
-            match self.dry_exceeds(ray, max_chunks) {
+            match self.dry_exceeds(&grid, max_chunks) {
                 Ok(true) => {
                     stats.capacity_rejected += 1;
                     return Ok(());
@@ -178,7 +171,7 @@ impl<M: RayUpdateModel, const SIDE: usize> RaySceneWriter<M, SIDE> {
         }
         let length = if self.model.needs_metric_length() {
             match segment_length(ray.source, ray.hit) {
-                Ok(length) => length,
+                Ok(length) => Some(length),
                 Err(LiveError::DistanceOverflow) => {
                     stats.distance_overflow += 1;
                     return Ok(());
@@ -189,44 +182,38 @@ impl<M: RayUpdateModel, const SIDE: usize> RaySceneWriter<M, SIDE> {
                 }
             }
         } else {
-            0.0
+            None
         };
         let step_limit = u64::try_from(upper.saturating_add(8)).unwrap_or(u64::MAX);
-        let geometry = self.geometry;
         let max_chunks = self.max_chunks;
+        let init = self.model.initial_cell();
         let mut partial = false;
         let walked = {
             let model = &mut self.model;
             let store = &mut self.store;
             let dirty = &mut self.dirty;
-            visit_ray(
-                &geometry,
-                ray.source,
-                ray.hit,
-                length,
-                step_limit,
-                |event| {
-                    if partial {
-                        return;
-                    }
-                    match store.with_voxel(event.key, max_chunks, |cell| model.update(cell, event))
-                    {
-                        CellTouch::OverCapacity => partial = true,
-                        CellTouch::Updated { chunk_key, newly } => {
-                            if newly {
-                                stats.newly_observed_cells += 1;
-                            }
-                            match event.role {
-                                RayCellRole::Free => stats.free_cell_updates += 1,
-                                RayCellRole::Hit => stats.hits_applied += 1,
-                            }
-                            if dirty.mark(chunk_key) {
-                                stats.dirty_chunks += 1;
-                            }
+            walk(&grid, length, step_limit, |event| {
+                if partial {
+                    return;
+                }
+                match store.with_voxel(event.key, max_chunks, init, |cell| {
+                    model.update(cell, event)
+                }) {
+                    CellTouch::OverCapacity => partial = true,
+                    CellTouch::Updated { chunk_key, newly } => {
+                        if newly {
+                            stats.newly_observed_cells += 1;
+                        }
+                        match event.role {
+                            RayCellRole::Free => stats.free_cell_updates += 1,
+                            RayCellRole::Hit => stats.hits_applied += 1,
+                        }
+                        if dirty.mark(chunk_key) {
+                            stats.dirty_chunks += 1;
                         }
                     }
-                },
-            )
+                }
+            })
         };
         if partial {
             return Err(LiveError::PartialUpdate { stats: *stats });
@@ -247,32 +234,23 @@ impl<M: RayUpdateModel, const SIDE: usize> RaySceneWriter<M, SIDE> {
         }
     }
 
-    fn dry_exceeds(&self, ray: RayObservation, max_chunks: u64) -> Result<bool, LiveError> {
-        let source_key = self.geometry.voxel_key(ray.source)?;
-        let hit_key = self.geometry.voxel_key(ray.hit)?;
-        let step_limit = u64::try_from(cell_upper_bound(source_key, hit_key).saturating_add(8))
-            .unwrap_or(u64::MAX);
+    fn dry_exceeds(&self, grid: &GridRay, max_chunks: u64) -> Result<bool, LiveError> {
+        let step_limit =
+            u64::try_from(grid.cell_upper_bound().saturating_add(8)).unwrap_or(u64::MAX);
         let mut fresh = std::collections::HashSet::new();
         let mut exceeded = false;
-        visit_ray(
-            &self.geometry,
-            ray.source,
-            ray.hit,
-            0.0,
-            step_limit,
-            |event| {
-                if exceeded {
-                    return;
-                }
-                let (chunk_key, _) = chunk_and_local(event.key, SIDE as i64);
-                if self.store.contains_key(chunk_key) || !fresh.insert(chunk_key) {
-                    return;
-                }
-                if self.store.chunk_count() + fresh.len() as u64 > max_chunks {
-                    exceeded = true;
-                }
-            },
-        )?;
+        walk(grid, None, step_limit, |event| {
+            if exceeded {
+                return;
+            }
+            let (chunk_key, _) = chunk_and_local(event.key, SIDE as i64);
+            if self.store.contains_key(chunk_key) || !fresh.insert(chunk_key) {
+                return;
+            }
+            if self.store.chunk_count() + fresh.len() as u64 > max_chunks {
+                exceeded = true;
+            }
+        })?;
         Ok(exceeded)
     }
 }
@@ -367,7 +345,7 @@ mod tests {
 
         fn update(&mut self, cell: &mut Self::Cell, event: RayCellContext) {
             if event.role == RayCellRole::Hit {
-                *cell = event.ray_length_m;
+                *cell = event.ray_length_m.expect("metric length requested");
             }
         }
     }
@@ -401,7 +379,7 @@ mod tests {
         assert!(stats.free_cell_updates > 0);
         let mut reference = HashMap::<VoxelKey, f32>::new();
         for ray in rays {
-            visit_ray(&geometry(), ray.source, ray.hit, 0.0, 128, |event| {
+            visit_ray(&geometry(), ray.source, ray.hit, None, 128, |event| {
                 let cell = reference.entry(event.key).or_insert(0.0);
                 let delta = match event.role {
                     RayCellRole::Hit => 0.85,
@@ -556,6 +534,53 @@ mod tests {
         writer.publish().unwrap();
         let length = reader.get_voxel_key(VoxelKey { x: 3, y: 4, z: 0 }).unwrap();
         assert!((length - 5.0).abs() < 1e-9);
+    }
+
+    struct PriorModel {
+        prior: f32,
+        saw_length: bool,
+    }
+
+    impl RayUpdateModel for PriorModel {
+        type Cell = f32;
+
+        fn initial_cell(&self) -> f32 {
+            self.prior
+        }
+
+        fn update(&mut self, cell: &mut f32, event: RayCellContext) {
+            self.saw_length |= event.ray_length_m.is_some();
+            *cell += match event.role {
+                RayCellRole::Hit => 1.0,
+                RayCellRole::Free => -0.25,
+            };
+        }
+    }
+
+    #[test]
+    fn model_initial_value_applies_once_and_length_is_absent_unless_requested() {
+        let model = PriorModel {
+            prior: -2.0,
+            saw_length: false,
+        };
+        let (mut writer, reader) =
+            open_ray_scene(geometry(), &RaySceneConfig::default(), model).unwrap();
+        let ray = RayObservation {
+            source: [0.5, 0.5, 0.5],
+            hit: [2.5, 0.5, 0.5],
+        };
+        writer.insert_rays(&[ray, ray]).unwrap();
+        writer.publish().unwrap();
+        assert_eq!(
+            reader.get_voxel_key(VoxelKey { x: 0, y: 0, z: 0 }),
+            Some(-2.5)
+        );
+        assert_eq!(
+            reader.get_voxel_key(VoxelKey { x: 2, y: 0, z: 0 }),
+            Some(0.0)
+        );
+        assert_eq!(reader.get_voxel_key(VoxelKey { x: 3, y: 0, z: 0 }), None);
+        assert!(!writer.model_mut().saw_length);
     }
 
     #[test]

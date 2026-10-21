@@ -42,13 +42,14 @@ fn main() {
         let mut resyncs = 0u32;
         let mut applied = 0u32;
         loop {
-            match observer_reader.changes_since(cursor) {
-                Ok(changes) => {
-                    if !changes.chunk_keys.is_empty() {
-                        let snapshot = observer_reader.snapshot_chunks(&changes.chunk_keys);
-                        assert_eq!(snapshot.generation(), changes.generation);
-                        cursor = snapshot.generation();
-                        applied += 1;
+            match observer_reader.snapshot_changes_since(cursor) {
+                Ok(snapshot) => {
+                    let generation = snapshot.generation();
+                    if generation != cursor {
+                        if !snapshot.chunks().is_empty() {
+                            applied += 1;
+                        }
+                        cursor = generation;
                     }
                 }
                 Err(_) => {

@@ -11,6 +11,12 @@ use super::{RangeClass, RangeFilter};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Occupied;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PointObservation {
+    pub source: [f64; 3],
+    pub point: [f64; 3],
+}
+
 pub trait PointCell: Copy + Default + Send + Sync + 'static {
     fn observe(cell: &mut Self);
 }
@@ -58,6 +64,7 @@ impl<Cell: PointCell, const SIDE: usize> PointSceneWriter<Cell, SIDE> {
     }
 
     pub fn insert_point(&mut self, point: [f64; 3]) -> Result<InsertStats, LiveError> {
+        self.require_unfiltered()?;
         let mut stats = BatchStats {
             input: 1,
             ..BatchStats::default()
@@ -67,12 +74,40 @@ impl<Cell: PointCell, const SIDE: usize> PointSceneWriter<Cell, SIDE> {
     }
 
     pub fn insert_points(&mut self, points: &[[f64; 3]]) -> Result<BatchStats, LiveError> {
+        self.require_unfiltered()?;
         let mut stats = BatchStats {
             input: points.len() as u64,
             ..BatchStats::default()
         };
         for point in points {
             self.ingest_point(*point, None, &mut stats);
+        }
+        Ok(stats)
+    }
+
+    pub fn insert_point_from_source(
+        &mut self,
+        source: [f64; 3],
+        point: [f64; 3],
+    ) -> Result<InsertStats, LiveError> {
+        let mut stats = BatchStats {
+            input: 1,
+            ..BatchStats::default()
+        };
+        self.ingest_point(point, Some(source), &mut stats);
+        Ok(stats.as_insert())
+    }
+
+    pub fn insert_point_observations(
+        &mut self,
+        observations: &[PointObservation],
+    ) -> Result<BatchStats, LiveError> {
+        let mut stats = BatchStats {
+            input: observations.len() as u64,
+            ..BatchStats::default()
+        };
+        for observation in observations {
+            self.ingest_point(observation.point, Some(observation.source), &mut stats);
         }
         Ok(stats)
     }
@@ -122,6 +157,14 @@ impl<Cell: PointCell, const SIDE: usize> PointSceneWriter<Cell, SIDE> {
         self.geometry
     }
 
+    fn require_unfiltered(&self) -> Result<(), LiveError> {
+        if self.range.is_some() {
+            Err(LiveError::RangeFilterRequiresSource)
+        } else {
+            Ok(())
+        }
+    }
+
     fn ingest_point(&mut self, point: [f64; 3], source: Option<[f64; 3]>, stats: &mut BatchStats) {
         if let Some(source) = source
             && let Some(filter) = self.range
@@ -149,7 +192,10 @@ impl<Cell: PointCell, const SIDE: usize> PointSceneWriter<Cell, SIDE> {
                 return;
             }
         };
-        match self.store.with_voxel(key, self.max_chunks, Cell::observe) {
+        match self
+            .store
+            .with_voxel(key, self.max_chunks, Cell::default(), Cell::observe)
+        {
             CellTouch::OverCapacity => stats.capacity_rejected += 1,
             CellTouch::Updated { chunk_key, newly } => {
                 stats.accepted += 1;
@@ -184,6 +230,7 @@ mod tests {
     use super::*;
     use crate::live::RangeFilter;
     use crate::live::config::JournalConfig;
+    use crate::live::error::ChangesError;
     use crate::live::geometry::{ChunkKey, VoxelBounds, VoxelKey};
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
@@ -258,32 +305,67 @@ mod tests {
             ..PointSceneConfig::default()
         };
         let geometry = VoxelGeometry::new([0.0, 0.0, 0.0], 1.0).unwrap();
-        let (mut writer, reader) = open_presence_scene(geometry, &config).unwrap();
-        let far = writer.insert_points(&[[50.0, 0.0, 0.0]]).unwrap();
+        let (mut plain, plain_reader) =
+            open_presence_scene(geometry, &PointSceneConfig::default()).unwrap();
+        let far = plain.insert_points(&[[50.0, 0.0, 0.0]]).unwrap();
         assert_eq!(far.accepted, 1);
         assert_eq!(far.filtered_by_range, 0);
+        let mixed = plain
+            .insert_points(&[[0.4, 0.4, 0.4], [f64::NAN, 0.0, 0.0], [-0.2, -0.2, -0.2]])
+            .unwrap();
+        assert_eq!(mixed.accepted, 2);
+        assert_eq!(mixed.invalid, 1);
+        plain.publish().unwrap();
+        assert!(
+            plain_reader
+                .get_voxel_world([50.0, 0.0, 0.0])
+                .unwrap()
+                .is_some()
+        );
+
+        let (mut writer, reader) = open_presence_scene(geometry, &config).unwrap();
+        assert_eq!(
+            writer.insert_points(&[[50.0, 0.0, 0.0]]).unwrap_err(),
+            LiveError::RangeFilterRequiresSource
+        );
+        assert_eq!(
+            writer.insert_point([0.2, 0.2, 0.2]).unwrap_err(),
+            LiveError::RangeFilterRequiresSource
+        );
+        assert_eq!(writer.observed_cells(), 0);
         let filtered = writer
             .insert_points_from_source([0.0, 0.0, 0.0], &[[50.0, 0.0, 0.0], [0.2, 0.2, 0.2]])
             .unwrap();
         assert_eq!(filtered.filtered_by_range, 1);
         assert_eq!(filtered.accepted, 1);
+        let per_source = writer
+            .insert_point_observations(&[
+                PointObservation {
+                    source: [0.0, 0.0, 0.0],
+                    point: [0.4, 0.4, 0.4],
+                },
+                PointObservation {
+                    source: [0.0, 0.0, 0.0],
+                    point: [40.2, 0.0, 0.0],
+                },
+            ])
+            .unwrap();
+        assert_eq!(per_source.accepted, 1);
+        assert_eq!(per_source.filtered_by_range, 1);
         let overflow = writer
             .insert_points_from_source([0.0, 0.0, 0.0], &[[1.0e308, 1.0e308, 1.0e308]])
             .unwrap();
         assert_eq!(overflow.distance_overflow, 1);
         assert_eq!(overflow.accepted, 0);
-        let mixed = writer
-            .insert_points(&[[0.4, 0.4, 0.4], [f64::NAN, 0.0, 0.0], [-0.2, -0.2, -0.2]])
-            .unwrap();
-        assert_eq!(mixed.accepted, 2);
-        assert_eq!(mixed.invalid, 1);
         writer.publish().unwrap();
-        assert!(reader.get_voxel_world([50.0, 0.0, 0.0]).unwrap().is_some());
+        assert!(reader.get_voxel_world([50.0, 0.0, 0.0]).unwrap().is_none());
         assert!(reader.get_voxel_world([0.2, 0.2, 0.2]).unwrap().is_some());
+        assert!(reader.get_voxel_world([0.4, 0.4, 0.4]).unwrap().is_some());
+        assert!(reader.get_voxel_world([40.2, 0.0, 0.0]).unwrap().is_none());
 
         let limited_config = PointSceneConfig {
             max_chunks: Some(1),
-            ..config
+            ..PointSceneConfig::default()
         };
         let (mut limited, limited_reader) = open_presence_scene(geometry, &limited_config).unwrap();
         assert_eq!(limited.insert_point([0.2, 0.2, 0.2]).unwrap().accepted, 1);
@@ -421,6 +503,75 @@ mod tests {
         writer.publish().unwrap();
         worker.join().unwrap();
         assert!(reader.generation() >= 2);
+    }
+
+    #[test]
+    fn later_partial_snapshot_skips_a_publish() {
+        let (mut writer, reader) = setup::<Occupied, 16>(PointSceneConfig::default());
+        writer.insert_point([0.5, 0.5, 0.5]).unwrap();
+        writer.publish().unwrap();
+        let cursor = reader.generation();
+        writer.insert_point([1.5, 0.5, 0.5]).unwrap();
+        writer.publish().unwrap();
+        let changes = reader.changes_since(cursor).unwrap();
+        writer.insert_point([100.5, 0.5, 0.5]).unwrap();
+        writer.publish().unwrap();
+        let partial = reader.snapshot_chunks(&changes.chunk_keys);
+        assert!(partial.generation() > changes.generation);
+        let skipped = reader.changes_since(partial.generation()).unwrap();
+        assert!(skipped.chunk_keys.is_empty());
+        assert!(
+            reader
+                .get_voxel_key(VoxelKey { x: 100, y: 0, z: 0 })
+                .is_some()
+        );
+        let caught = reader.changes_since(changes.generation).unwrap();
+        assert!(caught.chunk_keys.iter().any(|key| key.x == 6));
+        let observed = reader.snapshot_changes_since(cursor).unwrap();
+        assert_eq!(observed.generation(), reader.generation());
+        assert!(observed.chunk_keys().any(|key| key.x == 6));
+        assert!(
+            observed
+                .chunk_keys()
+                .any(|key| key == ChunkKey { x: 0, y: 0, z: 0 })
+        );
+        let next = reader.changes_since(observed.generation()).unwrap();
+        assert!(next.chunk_keys.is_empty());
+        assert!(matches!(
+            reader.changes_since(reader.generation() + 1),
+            Err(ChangesError::CursorAhead { .. })
+        ));
+    }
+
+    #[test]
+    fn requested_chunk_lookup_does_not_return_the_whole_map() {
+        let (mut writer, reader) = setup::<Occupied, 16>(PointSceneConfig::default());
+        for index in 0..2_000 {
+            writer
+                .insert_point([index as f64 * 16.0 + 0.1, 0.1, 0.1])
+                .unwrap();
+        }
+        writer.publish().unwrap();
+        let one = reader.snapshot_chunks(&[ChunkKey { x: 0, y: 0, z: 0 }]);
+        assert_eq!(one.chunks().len(), 1);
+        assert_eq!(one.chunks()[0].0, ChunkKey { x: 0, y: 0, z: 0 });
+        let region = reader
+            .snapshot_region(VoxelBounds {
+                min: VoxelKey { x: 0, y: 0, z: 0 },
+                max: VoxelKey { x: 0, y: 0, z: 0 },
+            })
+            .unwrap();
+        assert_eq!(region.chunks().len(), 1);
+        assert!(region.get(VoxelKey { x: 0, y: 0, z: 0 }).is_some());
+        assert!(region.get(VoxelKey { x: 16, y: 0, z: 0 }).is_none());
+        let missing = reader.snapshot_chunks(&[ChunkKey {
+            x: 9_999,
+            y: 0,
+            z: 0,
+        }]);
+        assert!(missing.chunks().is_empty());
+        assert_eq!(missing.generation(), reader.generation());
+        assert_eq!(reader.snapshot_all().chunks().len(), 2_000);
     }
 
     #[test]

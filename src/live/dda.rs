@@ -12,7 +12,7 @@ pub enum RayCellRole {
 pub struct RayCellContext {
     pub key: VoxelKey,
     pub role: RayCellRole,
-    pub ray_length_m: f64,
+    pub ray_length_m: Option<f64>,
     pub t_enter: f64,
     pub t_exit: f64,
 }
@@ -30,50 +30,108 @@ pub fn cell_upper_bound(start: VoxelKey, end: VoxelKey) -> u128 {
         + 1
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GridRay {
+    pub(crate) src: [f64; 3],
+    pub(crate) dst: [f64; 3],
+    pub(crate) start: VoxelKey,
+    pub(crate) end: VoxelKey,
+}
+
+impl GridRay {
+    pub(crate) fn new(
+        geometry: &VoxelGeometry,
+        source: [f64; 3],
+        hit: [f64; 3],
+    ) -> Result<Self, LiveError> {
+        let src = geometry.grid_coord(source)?;
+        let dst = geometry.grid_coord(hit)?;
+        Ok(Self {
+            src,
+            dst,
+            start: key_of(src)?,
+            end: key_of(dst)?,
+        })
+    }
+
+    pub(crate) fn cell_upper_bound(&self) -> u128 {
+        cell_upper_bound(self.start, self.end)
+    }
+}
+
+fn key_of(grid: [f64; 3]) -> Result<VoxelKey, LiveError> {
+    Ok(VoxelKey {
+        x: floor_exact(grid[0])?,
+        y: floor_exact(grid[1])?,
+        z: floor_exact(grid[2])?,
+    })
+}
+
 pub fn visit_ray<F>(
     geometry: &VoxelGeometry,
     source: [f64; 3],
     hit: [f64; 3],
-    ray_length_m: f64,
+    ray_length_m: Option<f64>,
+    step_limit: u64,
+    visit: F,
+) -> Result<RayWalk, LiveError>
+where
+    F: FnMut(RayCellContext),
+{
+    let ray = GridRay::new(geometry, source, hit)?;
+    walk(&ray, ray_length_m, step_limit, visit)
+}
+
+pub(crate) fn walk<F>(
+    ray: &GridRay,
+    ray_length_m: Option<f64>,
     step_limit: u64,
     mut visit: F,
 ) -> Result<RayWalk, LiveError>
 where
     F: FnMut(RayCellContext),
 {
-    let src = geometry.grid_coord(source)?;
-    let dst = geometry.grid_coord(hit)?;
-    let hit_key = VoxelKey {
-        x: floor_exact(dst[0])?,
-        y: floor_exact(dst[1])?,
-        z: floor_exact(dst[2])?,
+    let target = [ray.end.x, ray.end.y, ray.end.z];
+    let mut cell = [ray.start.x, ray.start.y, ray.start.z];
+    let context = |cell: [i64; 3], role, t_enter, t_exit| RayCellContext {
+        key: VoxelKey {
+            x: cell[0],
+            y: cell[1],
+            z: cell[2],
+        },
+        role,
+        ray_length_m,
+        t_enter,
+        t_exit,
     };
-    let mut x = floor_exact(src[0])?;
-    let mut y = floor_exact(src[1])?;
-    let mut z = floor_exact(src[2])?;
-    let delta = [dst[0] - src[0], dst[1] - src[1], dst[2] - src[2]];
+    let hit_only = RayWalk {
+        free_cells: 0,
+        hit_cells: 1,
+    };
 
-    if x == hit_key.x && y == hit_key.y && z == hit_key.z {
-        visit(context(x, y, z, RayCellRole::Hit, ray_length_m, 0.0, 1.0));
-        return Ok(RayWalk {
-            free_cells: 0,
-            hit_cells: 1,
-        });
+    if cell == target {
+        visit(context(target, RayCellRole::Hit, 0.0, 1.0));
+        return Ok(hit_only);
     }
 
-    let (step_x, t_delta_x, mut t_max_x) = axis_setup(src[0], x, delta[0]);
-    let (step_y, t_delta_y, mut t_max_y) = axis_setup(src[1], y, delta[1]);
-    let (step_z, t_delta_z, mut t_max_z) = axis_setup(src[2], z, delta[2]);
-    skip_boundary(&mut x, step_x, &mut t_max_x, t_delta_x);
-    skip_boundary(&mut y, step_y, &mut t_max_y, t_delta_y);
-    skip_boundary(&mut z, step_z, &mut t_max_z, t_delta_z);
+    let delta = [
+        ray.dst[0] - ray.src[0],
+        ray.dst[1] - ray.src[1],
+        ray.dst[2] - ray.src[2],
+    ];
+    let step = [step_of(delta[0]), step_of(delta[1]), step_of(delta[2])];
+    let mut t_next = [0.0f64; 3];
+    for axis in 0..3 {
+        t_next[axis] = crossing(ray.src[axis], delta[axis], step[axis], cell[axis]);
+        if step[axis] != 0 && t_next[axis] <= 0.0 {
+            cell[axis] += step[axis];
+            t_next[axis] = crossing(ray.src[axis], delta[axis], step[axis], cell[axis]);
+        }
+    }
 
-    if x == hit_key.x && y == hit_key.y && z == hit_key.z {
-        visit(context(x, y, z, RayCellRole::Hit, ray_length_m, 0.0, 1.0));
-        return Ok(RayWalk {
-            free_cells: 0,
-            hit_cells: 1,
-        });
+    if cell == target {
+        visit(context(target, RayCellRole::Hit, 0.0, 1.0));
+        return Ok(hit_only);
     }
 
     let mut t_enter: f64 = 0.0;
@@ -86,22 +144,14 @@ where
             });
         }
         steps += 1;
-        if x == hit_key.x && y == hit_key.y && z == hit_key.z {
-            visit(context(
-                x,
-                y,
-                z,
-                RayCellRole::Hit,
-                ray_length_m,
-                t_enter.min(1.0),
-                1.0,
-            ));
+        if cell == target {
+            visit(context(target, RayCellRole::Hit, t_enter.min(1.0), 1.0));
             return Ok(RayWalk {
                 free_cells,
                 hit_cells: 1,
             });
         }
-        let exit_t = t_max_x.min(t_max_y).min(t_max_z);
+        let exit_t = t_next[0].min(t_next[1]).min(t_next[2]);
         if exit_t.is_nan() {
             return Err(LiveError::TraversalFailed {
                 stats: BatchStats::default(),
@@ -109,57 +159,27 @@ where
         }
         if exit_t >= 1.0 {
             if t_enter < 1.0 {
-                visit(context(
-                    x,
-                    y,
-                    z,
-                    RayCellRole::Free,
-                    ray_length_m,
-                    t_enter,
-                    1.0,
-                ));
+                visit(context(cell, RayCellRole::Free, t_enter, 1.0));
                 free_cells += 1;
             }
-            visit(context(
-                hit_key.x,
-                hit_key.y,
-                hit_key.z,
-                RayCellRole::Hit,
-                ray_length_m,
-                1.0,
-                1.0,
-            ));
+            visit(context(target, RayCellRole::Hit, 1.0, 1.0));
             return Ok(RayWalk {
                 free_cells,
                 hit_cells: 1,
             });
         }
         if exit_t > t_enter {
-            visit(context(
-                x,
-                y,
-                z,
-                RayCellRole::Free,
-                ray_length_m,
-                t_enter,
-                exit_t,
-            ));
+            visit(context(cell, RayCellRole::Free, t_enter, exit_t));
             free_cells += 1;
         }
-        let previous = (x, y, z);
-        if t_max_x <= exit_t {
-            x += step_x;
-            t_max_x += t_delta_x;
+        let previous = cell;
+        for axis in 0..3 {
+            if t_next[axis] <= exit_t {
+                cell[axis] += step[axis];
+                t_next[axis] = crossing(ray.src[axis], delta[axis], step[axis], cell[axis]);
+            }
         }
-        if t_max_y <= exit_t {
-            y += step_y;
-            t_max_y += t_delta_y;
-        }
-        if t_max_z <= exit_t {
-            z += step_z;
-            t_max_z += t_delta_z;
-        }
-        if (x, y, z) == previous {
+        if cell == previous {
             return Err(LiveError::TraversalFailed {
                 stats: BatchStats::default(),
             });
@@ -168,40 +188,23 @@ where
     }
 }
 
-fn context(
-    x: i64,
-    y: i64,
-    z: i64,
-    role: RayCellRole,
-    ray_length_m: f64,
-    t_enter: f64,
-    t_exit: f64,
-) -> RayCellContext {
-    RayCellContext {
-        key: VoxelKey { x, y, z },
-        role,
-        ray_length_m,
-        t_enter,
-        t_exit,
-    }
-}
-
-fn axis_setup(src: f64, voxel: i64, delta: f64) -> (i64, f64, f64) {
+#[inline]
+fn step_of(delta: f64) -> i64 {
     if delta > 0.0 {
-        let next = voxel as f64 + 1.0;
-        (1, 1.0 / delta, (next - src) / delta)
+        1
     } else if delta < 0.0 {
-        let next = voxel as f64;
-        (-1, -1.0 / delta, (next - src) / delta)
+        -1
     } else {
-        (0, f64::INFINITY, f64::INFINITY)
+        0
     }
 }
 
-fn skip_boundary(voxel: &mut i64, step: i64, t_max: &mut f64, t_delta: f64) {
-    if step != 0 && *t_max <= 0.0 {
-        *voxel += step;
-        *t_max += t_delta;
+#[inline]
+fn crossing(src: f64, delta: f64, step: i64, voxel: i64) -> f64 {
+    match step {
+        1 => ((voxel + 1) as f64 - src) / delta,
+        -1 => (voxel as f64 - src) / delta,
+        _ => f64::INFINITY,
     }
 }
 
@@ -219,7 +222,7 @@ mod tests {
         let end = geometry.voxel_key(hit).unwrap();
         let limit = u64::try_from(cell_upper_bound(start, end).saturating_add(8)).unwrap();
         let mut cells = Vec::new();
-        visit_ray(geometry, source, hit, 0.0, limit, |cell| cells.push(cell)).unwrap();
+        visit_ray(geometry, source, hit, None, limit, |cell| cells.push(cell)).unwrap();
         cells
     }
 
@@ -415,7 +418,7 @@ mod tests {
                 &geometry,
                 [1.0e20, 0.0, 0.0],
                 [0.0, 0.0, 0.0],
-                0.0,
+                None,
                 10,
                 |_| {}
             ),
@@ -492,6 +495,282 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn key_at(grid: [f64; 3]) -> VoxelKey {
+        VoxelKey {
+            x: floor_exact(grid[0]).unwrap(),
+            y: floor_exact(grid[1]).unwrap(),
+            z: floor_exact(grid[2]).unwrap(),
+        }
+    }
+
+    fn crossing_reference(
+        geometry: &VoxelGeometry,
+        source: [f64; 3],
+        hit: [f64; 3],
+    ) -> Vec<(VoxelKey, RayCellRole)> {
+        let src = geometry.grid_coord(source).unwrap();
+        let dst = geometry.grid_coord(hit).unwrap();
+        let start = key_at(src);
+        let end = key_at(dst);
+        let delta = [dst[0] - src[0], dst[1] - src[1], dst[2] - src[2]];
+        let offset = [
+            src[0] - start.x as f64,
+            src[1] - start.y as f64,
+            src[2] - start.z as f64,
+        ];
+        let mut times = vec![0.0, 1.0];
+        for axis in 0..3 {
+            if delta[axis] == 0.0 {
+                continue;
+            }
+            let lo = src[axis].min(dst[axis]);
+            let hi = src[axis].max(dst[axis]);
+            let mut boundary = lo.floor() + 1.0;
+            while boundary < hi {
+                times.push((boundary - src[axis]) / delta[axis]);
+                boundary += 1.0;
+            }
+        }
+        times.sort_by(f64::total_cmp);
+        times.dedup();
+        let mut cells: Vec<(VoxelKey, RayCellRole)> = Vec::new();
+        for pair in times.windows(2) {
+            if pair[1] <= pair[0] {
+                continue;
+            }
+            let mid = 0.5 * (pair[0] + pair[1]);
+            let key = VoxelKey {
+                x: start.x + floor_exact(offset[0] + delta[0] * mid).unwrap(),
+                y: start.y + floor_exact(offset[1] + delta[1] * mid).unwrap(),
+                z: start.z + floor_exact(offset[2] + delta[2] * mid).unwrap(),
+            };
+            if key != end && cells.last() != Some(&(key, RayCellRole::Free)) {
+                cells.push((key, RayCellRole::Free));
+            }
+        }
+        cells.push((end, RayCellRole::Hit));
+        cells
+    }
+
+    fn assert_steps_follow_direction(
+        geometry: &VoxelGeometry,
+        source: [f64; 3],
+        hit: [f64; 3],
+        cells: &[RayCellContext],
+    ) {
+        let src = geometry.grid_coord(source).unwrap();
+        let dst = geometry.grid_coord(hit).unwrap();
+        let sign = |value: f64| {
+            if value > 0.0 {
+                1
+            } else if value < 0.0 {
+                -1
+            } else {
+                0
+            }
+        };
+        let direction = [
+            sign(dst[0] - src[0]),
+            sign(dst[1] - src[1]),
+            sign(dst[2] - src[2]),
+        ];
+        for pair in cells.windows(2) {
+            let step = [
+                pair[1].key.x - pair[0].key.x,
+                pair[1].key.y - pair[0].key.y,
+                pair[1].key.z - pair[0].key.z,
+            ];
+            assert_ne!(step, [0, 0, 0], "source {source:?} hit {hit:?}");
+            for axis in 0..3 {
+                assert!(
+                    step[axis] == 0 || step[axis] == direction[axis],
+                    "source {source:?} hit {hit:?} step {step:?}"
+                );
+            }
+        }
+    }
+
+    fn axes_changed(pair: &[RayCellContext]) -> usize {
+        usize::from(pair[0].key.x != pair[1].key.x)
+            + usize::from(pair[0].key.y != pair[1].key.y)
+            + usize::from(pair[0].key.z != pair[1].key.z)
+    }
+
+    #[test]
+    fn long_two_axis_ties_step_together() {
+        let geometry = geometry([0.0, 0.0, 0.0], 1.0);
+        let source = [0.5, 0.5, 0.5];
+        let hit = [30.5, 10.5, 0.5];
+        let cells = walk(&geometry, source, hit);
+        assert_eq!(cells.len(), 31);
+        assert_eq!(cells.last().unwrap().key, VoxelKey { x: 30, y: 10, z: 0 });
+        let diagonal = cells
+            .windows(2)
+            .filter(|pair| axes_changed(pair) == 2)
+            .count();
+        assert_eq!(diagonal, 10);
+        assert_eq!(keys(&cells), crossing_reference(&geometry, source, hit));
+        assert_steps_follow_direction(&geometry, source, hit, &cells);
+    }
+
+    #[test]
+    fn long_three_axis_ties_from_corner_to_corner() {
+        let geometry = geometry([0.0, 0.0, 0.0], 1.0);
+        let source = [0.0, 0.0, 0.0];
+        let hit = [24.0, 12.0, 8.0];
+        let cells = walk(&geometry, source, hit);
+        assert_eq!(cells.len(), 25);
+        let free = &cells[..24];
+        assert!(free.iter().all(|cell| cell.role == RayCellRole::Free));
+        for (k, cell) in free.iter().enumerate() {
+            let k = k as i64;
+            assert_eq!(
+                cell.key,
+                VoxelKey {
+                    x: k,
+                    y: k / 2,
+                    z: k / 3
+                }
+            );
+            assert!(cell.t_exit > cell.t_enter);
+        }
+        let triple = free
+            .windows(2)
+            .filter(|pair| axes_changed(pair) == 3)
+            .count();
+        let double = free
+            .windows(2)
+            .filter(|pair| axes_changed(pair) == 2)
+            .count();
+        assert_eq!(triple, 3);
+        assert_eq!(double, 12);
+        assert_eq!(cells[24].key, VoxelKey { x: 24, y: 12, z: 8 });
+        assert_eq!(cells[24].role, RayCellRole::Hit);
+        assert_eq!(keys(&cells), crossing_reference(&geometry, source, hit));
+        assert_steps_follow_direction(&geometry, source, hit, &cells);
+    }
+
+    #[test]
+    fn long_negative_ties_with_shifted_origin() {
+        let geometry = geometry([0.0, 0.0, 0.0], 1.0);
+        let source = [19.75, 8.0, 6.0];
+        let hit = [-13.75, 17.0, -12.0];
+        let cells = walk(&geometry, source, hit);
+        assert_eq!(keys(&cells), crossing_reference(&geometry, source, hit));
+        assert_steps_follow_direction(&geometry, source, hit, &cells);
+        for cell in &cells[..cells.len() - 1] {
+            assert!(cell.t_exit > cell.t_enter);
+        }
+        let shifted = geometry_at([2.0, -3.0, 1.5], 0.25);
+        let source = [2.0 + 6.0 * 0.25, -3.0 - 2.0 * 0.25, 1.5 + 9.0 * 0.25];
+        let hit = [2.0 - 30.0 * 0.25, -3.0 + 18.0 * 0.25, 1.5 - 3.0 * 0.25];
+        let cells = walk(&shifted, source, hit);
+        assert_eq!(keys(&cells), crossing_reference(&shifted, source, hit));
+        assert_steps_follow_direction(&shifted, source, hit, &cells);
+    }
+
+    #[test]
+    fn exact_grid_endpoint_adds_no_free_cell_beyond_the_hit() {
+        let geometry = geometry([0.0, 0.0, 0.0], 0.25);
+        let source = [-0.8125, -0.3125, 1.375];
+        let hit = [0.0, -1.0, 0.5];
+        let cells = walk(&geometry, source, hit);
+        assert_eq!(keys(&cells), crossing_reference(&geometry, source, hit));
+        assert_steps_follow_direction(&geometry, source, hit, &cells);
+        let end = cells.last().unwrap();
+        assert_eq!(end.key, VoxelKey { x: 0, y: -4, z: 2 });
+        for cell in &cells[..cells.len() - 1] {
+            assert!(cell.key.x <= -1 && cell.key.y >= -4 && cell.key.z >= 2);
+        }
+    }
+
+    #[test]
+    fn exact_grid_rays_match_crossing_reference() {
+        let origins = [[0.0, 0.0, 0.0], [2.0, -3.0, 1.5]];
+        let mut lcg = Lcg(0x5eed_0000_0000_0001);
+        let mut multi_axis_steps = 0usize;
+        for index in 0..6_000usize {
+            let size = [0.25, 0.5, 1.0][index % 3];
+            let geometry = geometry_at(origins[(index / 3) % 2], size);
+            let mut quarter = || ((lcg.next_unit() * 48.0 - 24.0) * 4.0).round() / 4.0 * size;
+            let source = [quarter(), quarter(), quarter()];
+            let hit = [quarter(), quarter(), quarter()];
+            let cells = walk(&geometry, source, hit);
+            assert_eq!(
+                keys(&cells),
+                crossing_reference(&geometry, source, hit),
+                "source {source:?} hit {hit:?} size {size}"
+            );
+            assert_steps_follow_direction(&geometry, source, hit, &cells);
+            multi_axis_steps += cells
+                .windows(2)
+                .filter(|pair| axes_changed(pair) > 1)
+                .count();
+        }
+        assert!(multi_axis_steps > 1_000);
+    }
+
+    #[test]
+    fn long_random_rays_terminate_with_monotone_steps() {
+        let sizes = [0.05, 0.1, 0.2, 0.3, 1.7];
+        let mut lcg = Lcg(0xfeed_beef_0000_0007);
+        for index in 0..4_000usize {
+            let size = sizes[index % sizes.len()];
+            let origin = random_point(&mut lcg, -50.0, 50.0);
+            let geometry = geometry_at(origin, size);
+            let source = random_point(&mut lcg, -500.0, 500.0);
+            let mut direction = random_point(&mut lcg, -1.0, 1.0);
+            let norm = (direction[0] * direction[0]
+                + direction[1] * direction[1]
+                + direction[2] * direction[2])
+                .sqrt()
+                .max(1.0e-6);
+            for value in &mut direction {
+                *value /= norm;
+            }
+            let length = lcg.next_unit() * 400.0 * size;
+            let hit = [
+                source[0] + direction[0] * length,
+                source[1] + direction[1] * length,
+                source[2] + direction[2] * length,
+            ];
+            let cells = walk(&geometry, source, hit);
+            assert_eq!(cells.last().unwrap().key, geometry.voxel_key(hit).unwrap());
+            assert_eq!(
+                cells
+                    .iter()
+                    .filter(|cell| cell.role == RayCellRole::Hit)
+                    .count(),
+                1
+            );
+            let unique: std::collections::HashSet<_> = cells.iter().map(|cell| cell.key).collect();
+            assert_eq!(unique.len(), cells.len());
+            assert_steps_follow_direction(&geometry, source, hit, &cells);
+            for cell in &cells[..cells.len() - 1] {
+                assert!(cell.t_exit > cell.t_enter);
+            }
+        }
+    }
+
+    #[test]
+    fn extreme_indices_traverse_exactly() {
+        let geometry = geometry([0.0, 0.0, 0.0], 1.0);
+        let big = 1_125_899_906_842_624.0;
+        let source = [big + 0.5, -big + 0.5, 0.5];
+        let hit = [big + 20.5, -big + 7.5, 0.5];
+        let cells = walk(&geometry, source, hit);
+        assert_eq!(cells.len(), 28);
+        assert_eq!(keys(&cells), crossing_reference(&geometry, source, hit));
+        let back = walk(&geometry, hit, source);
+        assert_eq!(back.len(), 28);
+        assert_eq!(keys(&back), crossing_reference(&geometry, hit, source));
+        assert_steps_follow_direction(&geometry, hit, source, &back);
+    }
+
+    fn geometry_at(origin: [f64; 3], size: f64) -> VoxelGeometry {
+        VoxelGeometry::new(origin, size).unwrap()
     }
 
     struct Lcg(u64);

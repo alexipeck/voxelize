@@ -1,10 +1,10 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::chunk::PublishedChunk;
 use super::config::JournalConfig;
-use super::error::{ChangeHistoryLost, LiveError};
+use super::error::{ChangeHistoryLost, ChangesError, LiveError};
 use super::geometry::{ChunkKey, VoxelBounds, VoxelGeometry, VoxelKey, chunk_and_local};
 use super::stats::{PublishStats, SceneMemoryStats};
 
@@ -13,14 +13,56 @@ struct JournalRecord {
     keys: Vec<ChunkKey>,
 }
 
+type ChunkHandle<Cell> = (ChunkKey, Arc<PublishedChunk<Cell>>);
+
 struct PublishedState<Cell> {
     chunks: HashMap<ChunkKey, Arc<PublishedChunk<Cell>>>,
     generation: u64,
     published_unix_ms: Option<u64>,
+    published_at: Option<Instant>,
     journal: VecDeque<JournalRecord>,
     journal_keys: usize,
     max_generations: usize,
     max_keys: usize,
+}
+
+impl<Cell> PublishedState<Cell> {
+    fn check_cursor(&self, cursor: u64) -> Result<(), ChangesError> {
+        let current = self.generation;
+        if cursor > current {
+            return Err(ChangesError::CursorAhead {
+                requested_generation: cursor,
+                current_generation: current,
+            });
+        }
+        let oldest = match self.journal.front() {
+            Some(entry) => entry.generation.saturating_sub(1),
+            None => current,
+        };
+        if cursor < oldest {
+            return Err(ChangesError::HistoryLost(ChangeHistoryLost {
+                requested_generation: cursor,
+                oldest_available_generation: oldest,
+                current_generation: current,
+            }));
+        }
+        Ok(())
+    }
+
+    fn keys_since(&self, cursor: u64, out: &mut Vec<ChunkKey>) {
+        for entry in self.journal.iter().rev() {
+            if entry.generation <= cursor {
+                break;
+            }
+            out.extend_from_slice(&entry.keys);
+        }
+    }
+
+    fn push_present(&self, key: ChunkKey, out: &mut Vec<ChunkHandle<Cell>>) {
+        if let Some(chunk) = self.chunks.get(&key) {
+            out.push((key, Arc::clone(chunk)));
+        }
+    }
 }
 
 pub(crate) struct PublishedIndex<Cell> {
@@ -35,6 +77,7 @@ impl<Cell> PublishedIndex<Cell> {
                 chunks: HashMap::new(),
                 generation: 0,
                 published_unix_ms: None,
+                published_at: None,
                 journal: VecDeque::new(),
                 journal_keys: 0,
                 max_generations: journal.max_generations,
@@ -63,36 +106,50 @@ impl<Cell> PublishedIndex<Cell> {
         self.read().published_unix_ms
     }
 
+    pub(crate) fn published_at(&self) -> Option<Instant> {
+        self.read().published_at
+    }
+
     pub(crate) fn commit(
         &self,
-        prepared: Vec<(ChunkKey, PublishedChunk<Cell>)>,
-        started: std::time::Instant,
+        prepared: Vec<ChunkHandle<Cell>>,
+        started: Instant,
     ) -> Result<PublishStats, LiveError> {
         let chunks_published = prepared.len() as u64;
-        let mut guard = self.write();
-        let generation = guard
-            .generation
-            .checked_add(1)
-            .ok_or(LiveError::GenerationOverflow)?;
-        let mut keys = Vec::with_capacity(prepared.len());
-        for (key, chunk) in prepared {
-            keys.push(key);
-            guard.chunks.insert(key, Arc::new(chunk));
-        }
-        guard.journal_keys = guard.journal_keys.saturating_add(keys.len());
-        guard.journal.push_back(JournalRecord { generation, keys });
-        while guard.journal.len() > guard.max_generations
-            || (guard.journal_keys > guard.max_keys && guard.journal.len() > 1)
-        {
-            if let Some(old) = guard.journal.pop_front() {
-                guard.journal_keys = guard.journal_keys.saturating_sub(old.keys.len());
-            } else {
-                break;
-            }
-        }
-        guard.generation = generation;
+        let keys: Vec<ChunkKey> = prepared.iter().map(|(key, _)| *key).collect();
+        let key_count = keys.len();
         let published_unix_ms = unix_ms();
-        guard.published_unix_ms = Some(published_unix_ms);
+        let mut retired = Vec::with_capacity(prepared.len());
+        let mut trimmed = Vec::new();
+        let generation = {
+            let mut guard = self.write();
+            let generation = guard
+                .generation
+                .checked_add(1)
+                .ok_or(LiveError::GenerationOverflow)?;
+            for (key, chunk) in prepared {
+                if let Some(old) = guard.chunks.insert(key, chunk) {
+                    retired.push(old);
+                }
+            }
+            guard.journal_keys = guard.journal_keys.saturating_add(key_count);
+            guard.journal.push_back(JournalRecord { generation, keys });
+            while guard.journal.len() > guard.max_generations
+                || (guard.journal_keys > guard.max_keys && guard.journal.len() > 1)
+            {
+                let Some(old) = guard.journal.pop_front() else {
+                    break;
+                };
+                guard.journal_keys = guard.journal_keys.saturating_sub(old.keys.len());
+                trimmed.push(old);
+            }
+            guard.generation = generation;
+            guard.published_unix_ms = Some(published_unix_ms);
+            guard.published_at = Some(Instant::now());
+            generation
+        };
+        drop(retired);
+        drop(trimmed);
         let duration_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         Ok(PublishStats {
             generation,
@@ -102,30 +159,18 @@ impl<Cell> PublishedIndex<Cell> {
         })
     }
 
-    pub(crate) fn changes_since(&self, cursor: u64) -> Result<Changes, ChangeHistoryLost> {
-        let guard = self.read();
-        let current = guard.generation;
-        let oldest = match guard.journal.front() {
-            Some(entry) => entry.generation.saturating_sub(1),
-            None => current,
+    pub(crate) fn changes_since(&self, cursor: u64) -> Result<Changes, ChangesError> {
+        let mut chunk_keys = Vec::new();
+        let generation = {
+            let guard = self.read();
+            guard.check_cursor(cursor)?;
+            guard.keys_since(cursor, &mut chunk_keys);
+            guard.generation
         };
-        if cursor > current || cursor < oldest {
-            return Err(ChangeHistoryLost {
-                requested_generation: cursor,
-                oldest_available_generation: oldest,
-                current_generation: current,
-            });
-        }
-        let mut seen = HashSet::new();
-        for entry in &guard.journal {
-            if entry.generation > cursor {
-                seen.extend(entry.keys.iter().copied());
-            }
-        }
-        let mut chunk_keys: Vec<ChunkKey> = seen.into_iter().collect();
         chunk_keys.sort_unstable();
+        chunk_keys.dedup();
         Ok(Changes {
-            generation: current,
+            generation,
             chunk_keys,
         })
     }
@@ -155,25 +200,90 @@ impl<Cell> PublishedIndex<Cell> {
         }
     }
 
-    fn collect(
-        &self,
-        mut select: impl FnMut(&ChunkKey) -> bool,
-        side: i64,
-    ) -> PublishedSnapshot<Cell> {
-        let guard = self.read();
+    fn snapshot_keys(&self, keys: &[ChunkKey], side: i64) -> PublishedSnapshot<Cell> {
+        let mut chunks = Vec::with_capacity(keys.len());
+        let (generation, published_at) = {
+            let guard = self.read();
+            for key in keys {
+                guard.push_present(*key, &mut chunks);
+            }
+            (guard.generation, guard.published_at)
+        };
+        PublishedSnapshot::new(generation, published_at, chunks, side, None)
+    }
+
+    fn snapshot_region(&self, bounds: VoxelBounds, side: i64) -> PublishedSnapshot<Cell> {
+        let (min, _) = chunk_and_local(bounds.min, side);
+        let (max, _) = chunk_and_local(bounds.max, side);
+        let span = |lo: i64, hi: i64| u128::from(hi.abs_diff(lo)) + 1;
+        let region_chunks = span(min.x, max.x)
+            .checked_mul(span(min.y, max.y))
+            .and_then(|area| area.checked_mul(span(min.z, max.z)));
         let mut chunks = Vec::new();
-        for (key, chunk) in &guard.chunks {
-            if select(key) {
+        let (generation, published_at) = {
+            let guard = self.read();
+            if region_chunks.is_some_and(|count| count <= guard.chunks.len() as u128) {
+                for z in min.z..=max.z {
+                    for y in min.y..=max.y {
+                        for x in min.x..=max.x {
+                            guard.push_present(ChunkKey { x, y, z }, &mut chunks);
+                        }
+                    }
+                }
+            } else {
+                for (key, chunk) in &guard.chunks {
+                    if key.x >= min.x
+                        && key.x <= max.x
+                        && key.y >= min.y
+                        && key.y <= max.y
+                        && key.z >= min.z
+                        && key.z <= max.z
+                    {
+                        chunks.push((*key, Arc::clone(chunk)));
+                    }
+                }
+            }
+            (guard.generation, guard.published_at)
+        };
+        PublishedSnapshot::new(generation, published_at, chunks, side, Some(bounds))
+    }
+
+    fn snapshot_all(&self, side: i64) -> PublishedSnapshot<Cell> {
+        let (generation, published_at, chunks) = {
+            let guard = self.read();
+            let mut chunks = Vec::with_capacity(guard.chunks.len());
+            for (key, chunk) in &guard.chunks {
                 chunks.push((*key, Arc::clone(chunk)));
             }
-        }
-        chunks.sort_unstable_by_key(|(key, _)| *key);
-        chunks.dedup_by_key(|(key, _)| *key);
-        PublishedSnapshot {
-            generation: guard.generation,
+            (guard.generation, guard.published_at, chunks)
+        };
+        PublishedSnapshot::new(generation, published_at, chunks, side, None)
+    }
+
+    fn snapshot_changes_since(
+        &self,
+        cursor: u64,
+        side: i64,
+    ) -> Result<PublishedSnapshot<Cell>, ChangesError> {
+        let mut keys = Vec::new();
+        let mut chunks = Vec::new();
+        let (generation, published_at) = {
+            let guard = self.read();
+            guard.check_cursor(cursor)?;
+            guard.keys_since(cursor, &mut keys);
+            chunks.reserve(keys.len());
+            for key in &keys {
+                guard.push_present(*key, &mut chunks);
+            }
+            (guard.generation, guard.published_at)
+        };
+        Ok(PublishedSnapshot::new(
+            generation,
+            published_at,
             chunks,
             side,
-        }
+            None,
+        ))
     }
 }
 
@@ -212,8 +322,7 @@ impl<Cell> SceneReader<Cell> {
     }
 
     pub fn publication_age(&self) -> Option<Duration> {
-        let published = self.published_at_unix_ms()?;
-        Some(Duration::from_millis(unix_ms().saturating_sub(published)))
+        self.index.published_at().map(|at| at.elapsed())
     }
 
     pub fn geometry(&self) -> VoxelGeometry {
@@ -234,43 +343,62 @@ impl<Cell: Copy> SceneReader<Cell> {
     }
 
     pub fn snapshot_chunks(&self, keys: &[ChunkKey]) -> PublishedSnapshot<Cell> {
-        let wanted: HashSet<ChunkKey> = keys.iter().copied().collect();
-        self.index.collect(|key| wanted.contains(key), self.side)
+        let mut wanted = keys.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+        self.index.snapshot_keys(&wanted, self.side)
     }
 
     pub fn snapshot_region(
         &self,
         bounds: VoxelBounds,
     ) -> Result<PublishedSnapshot<Cell>, LiveError> {
-        VoxelBounds::try_new(bounds.min, bounds.max)?;
-        let (min_chunk, _) = chunk_and_local(bounds.min, self.side);
-        let (max_chunk, _) = chunk_and_local(bounds.max, self.side);
-        Ok(self.index.collect(
-            |key| {
-                key.x >= min_chunk.x
-                    && key.x <= max_chunk.x
-                    && key.y >= min_chunk.y
-                    && key.y <= max_chunk.y
-                    && key.z >= min_chunk.z
-                    && key.z <= max_chunk.z
-            },
-            self.side,
-        ))
+        let bounds = VoxelBounds::try_new(bounds.min, bounds.max)?;
+        Ok(self.index.snapshot_region(bounds, self.side))
     }
 
     pub fn snapshot_all(&self) -> PublishedSnapshot<Cell> {
-        self.index.collect(|_| true, self.side)
+        self.index.snapshot_all(self.side)
     }
 
-    pub fn changes_since(&self, generation: u64) -> Result<Changes, ChangeHistoryLost> {
+    pub fn changes_since(&self, generation: u64) -> Result<Changes, ChangesError> {
         self.index.changes_since(generation)
+    }
+
+    pub fn snapshot_changes_since(
+        &self,
+        generation: u64,
+    ) -> Result<PublishedSnapshot<Cell>, ChangesError> {
+        self.index.snapshot_changes_since(generation, self.side)
     }
 }
 
 pub struct PublishedSnapshot<Cell> {
     generation: u64,
-    chunks: Vec<(ChunkKey, Arc<PublishedChunk<Cell>>)>,
+    published_at: Option<Instant>,
+    chunks: Vec<ChunkHandle<Cell>>,
     side: i64,
+    bounds: Option<VoxelBounds>,
+}
+
+impl<Cell> PublishedSnapshot<Cell> {
+    fn new(
+        generation: u64,
+        published_at: Option<Instant>,
+        mut chunks: Vec<ChunkHandle<Cell>>,
+        side: i64,
+        bounds: Option<VoxelBounds>,
+    ) -> Self {
+        chunks.sort_unstable_by_key(|(key, _)| *key);
+        chunks.dedup_by_key(|(key, _)| *key);
+        Self {
+            generation,
+            published_at,
+            chunks,
+            side,
+            bounds,
+        }
+    }
 }
 
 impl<Cell: Copy> PublishedSnapshot<Cell> {
@@ -278,11 +406,30 @@ impl<Cell: Copy> PublishedSnapshot<Cell> {
         self.generation
     }
 
-    pub fn chunks(&self) -> &[(ChunkKey, Arc<PublishedChunk<Cell>>)] {
+    pub fn published_at(&self) -> Option<Instant> {
+        self.published_at
+    }
+
+    pub fn age(&self) -> Option<Duration> {
+        self.published_at.map(|at| at.elapsed())
+    }
+
+    pub fn bounds(&self) -> Option<VoxelBounds> {
+        self.bounds
+    }
+
+    pub fn chunks(&self) -> &[ChunkHandle<Cell>] {
         &self.chunks
     }
 
+    pub fn chunk_keys(&self) -> impl Iterator<Item = ChunkKey> + '_ {
+        self.chunks.iter().map(|(key, _)| *key)
+    }
+
     pub fn get(&self, key: VoxelKey) -> Option<Cell> {
+        if self.bounds.is_some_and(|bounds| !bounds.contains(key)) {
+            return None;
+        }
         let (chunk_key, local) = chunk_and_local(key, self.side);
         let index = self
             .chunks
@@ -292,11 +439,11 @@ impl<Cell: Copy> PublishedSnapshot<Cell> {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (VoxelKey, Cell)> + '_ {
-        self.chunks.iter().flat_map(|(chunk_key, chunk)| {
-            let mut cells = Vec::new();
-            chunk.for_each_cell(*chunk_key, |key, cell| cells.push((key, cell)));
-            cells
-        })
+        let bounds = self.bounds;
+        self.chunks
+            .iter()
+            .flat_map(|(chunk_key, chunk)| chunk.cells(*chunk_key))
+            .filter(move |(key, _)| bounds.is_none_or(|bounds| bounds.contains(*key)))
     }
 }
 
@@ -323,12 +470,12 @@ where
             published_unix_ms: index.published_unix_ms().unwrap_or(0),
         });
     }
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let mut keys: Vec<ChunkKey> = dirty.keys().collect();
     keys.sort_unstable();
     let mut prepared = Vec::with_capacity(keys.len());
     for key in keys {
-        prepared.push((key, snapshot(key)?));
+        prepared.push((key, Arc::new(snapshot(key)?)));
     }
     let stats = index.commit(prepared, started)?;
     dirty.clear();

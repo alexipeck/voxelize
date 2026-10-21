@@ -9,6 +9,10 @@ pub trait RayUpdateModel: Send + 'static {
     fn needs_metric_length(&self) -> bool {
         false
     }
+
+    fn initial_cell(&self) -> Self::Cell {
+        Self::Cell::default()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -101,7 +105,7 @@ mod tests {
         RayCellContext {
             key: VoxelKey { x: 0, y: 0, z: 0 },
             role,
-            ray_length_m: 0.0,
+            ray_length_m: None,
             t_enter: 0.0,
             t_exit: 1.0,
         }

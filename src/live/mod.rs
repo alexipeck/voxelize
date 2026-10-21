@@ -17,12 +17,14 @@ pub use config::{
     RangeClass, RangeFilter, RaySceneConfig,
 };
 pub use dda::{RayCellContext, RayCellRole, RayWalk, cell_upper_bound, visit_ray};
-pub use error::{ChangeHistoryLost, LiveError};
+pub use error::{ChangeHistoryLost, ChangesError, LiveError};
 pub use geometry::{
     ChunkKey, VoxelBounds, VoxelGeometry, VoxelKey, chunk_and_local, voxel_from_chunk,
 };
 pub use model::{LogOddsOccupancy, RayUpdateModel, log_odds_to_probability};
-pub use point::{Occupied, PointCell, PointSceneWriter, open_count_scene, open_presence_scene};
+pub use point::{
+    Occupied, PointCell, PointObservation, PointSceneWriter, open_count_scene, open_presence_scene,
+};
 pub use published::{Changes, PublishedSnapshot, SceneReader};
 pub use ray::{RayObservation, RaySceneWriter, open_ray_scene};
 pub use stats::{BatchStats, InsertStats, PublishStats, SceneMemoryStats};

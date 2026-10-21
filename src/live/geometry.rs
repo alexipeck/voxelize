@@ -29,6 +29,15 @@ impl VoxelBounds {
         }
         Ok(Self { min, max })
     }
+
+    pub fn contains(&self, key: VoxelKey) -> bool {
+        key.x >= self.min.x
+            && key.x <= self.max.x
+            && key.y >= self.min.y
+            && key.y <= self.max.y
+            && key.z >= self.min.z
+            && key.z <= self.max.z
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

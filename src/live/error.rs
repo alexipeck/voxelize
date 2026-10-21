@@ -20,6 +20,10 @@ pub enum LiveError {
     InvalidCoordinate,
     #[error("sensor-to-hit distance is not finite")]
     DistanceOverflow,
+    #[error(
+        "a range filter is configured, so points need a sensor origin; use insert_points_from_source or insert_point_observations"
+    )]
+    RangeFilterRequiresSource,
     #[error("voxel bounds are inverted")]
     InvalidBounds,
     #[error("publication generation overflowed")]
@@ -50,3 +54,29 @@ impl std::fmt::Display for ChangeHistoryLost {
 }
 
 impl std::error::Error for ChangeHistoryLost {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangesError {
+    HistoryLost(ChangeHistoryLost),
+    CursorAhead {
+        requested_generation: u64,
+        current_generation: u64,
+    },
+}
+
+impl std::fmt::Display for ChangesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HistoryLost(lost) => lost.fmt(f),
+            Self::CursorAhead {
+                requested_generation,
+                current_generation,
+            } => write!(
+                f,
+                "cursor generation {requested_generation} is ahead of published generation {current_generation}; it did not come from this scene"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ChangesError {}

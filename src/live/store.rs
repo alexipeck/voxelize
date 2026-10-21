@@ -110,6 +110,7 @@ where
         &mut self,
         voxel: VoxelKey,
         max_chunks: Option<u64>,
+        init: Cell,
         f: impl FnOnce(&mut Cell),
     ) -> CellTouch {
         let (chunk_key, local, slot) = match self.slot_for(voxel, max_chunks) {
@@ -117,7 +118,7 @@ where
             None => return CellTouch::OverCapacity,
         };
         let mut newly = false;
-        self.slots[slot as usize].with_local(local, |cell, is_new| {
+        self.slots[slot as usize].with_local(local, init, |cell, is_new| {
             newly = is_new;
             f(cell);
         });
