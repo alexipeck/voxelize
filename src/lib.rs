@@ -1,13 +1,14 @@
 mod cancel;
 mod classification;
 mod error;
+pub mod live;
 mod pipeline;
 mod voxel_grid;
 
 pub use cancel::CancellationToken;
 pub use classification::ClassificationFilter;
 pub use error::{Result, VoxelizeError};
-pub use voxel_grid::{VoxelGrid, VoxelPoint, BOUNDED_QUEUE_CAPACITY, CHUNK_SIZE};
+pub use voxel_grid::{BOUNDED_QUEUE_CAPACITY, CHUNK_SIZE, VoxelGrid, VoxelPoint};
 
 use std::path::Path;
 

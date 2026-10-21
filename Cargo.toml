@@ -17,6 +17,18 @@ categories = ["command-line-utilities", "science"]
 name = "voxelize"
 path = "src/main.rs"
 
+[[bench]]
+name = "live_points"
+harness = false
+
+[[bench]]
+name = "live_rays"
+harness = false
+
+[[bench]]
+name = "live_publication"
+harness = false
+
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }

@@ -36,3 +36,30 @@ match voxelaz::voxelize(input, output, &config) {
 Fallible APIs return `voxelaz::Result<T>` (`Result<T, VoxelizeError>`). LAS I/O failures surface as `VoxelizeError::Las`. The CLI binary still reports errors via `anyhow`; library callers can use `?` with `anyhow::Result` because `VoxelizeError` implements `std::error::Error`.
 
 `VoxelizeConfig::new(voxel_size)` sets `classification_filter` to all codes and `counts_as_intensity` to `false`.
+
+## Live scene
+
+`voxelaz::live` is a separate, persistent scene for a stream of world-frame points or sensor-to-hit rays. It does not read LAS/LAZ files and it does not depend on the offline grid. One `PointSceneWriter` or `RaySceneWriter` owns the mutable chunks. `insert_point`, `insert_points`, `insert_ray`, and `insert_rays` take `&mut self`. Any number of `SceneReader` handles can be cloned onto other threads. Readers see the last successful `publish`, not each inserted observation.
+
+```text
+use voxelaz::live::{open_presence_scene, PointSceneConfig, VoxelGeometry};
+
+let geometry = VoxelGeometry::new([0.0, 0.0, 0.0], 0.2)?;
+let (mut writer, reader) = open_presence_scene(geometry, &PointSceneConfig::default())?;
+writer.insert_points(&[[0.1, 0.2, 0.3]])?;
+assert!(reader.get_voxel_world([0.1, 0.2, 0.3])?.is_none());
+writer.publish()?;
+assert!(reader.get_voxel_world([0.1, 0.2, 0.3])?.is_some());
+```
+
+Count mode is `open_count_scene`. Ray mode is `open_ray_scene` with a `RayUpdateModel`. `LogOddsOccupancy` is a reference clamp, `new = clamp(old + hit_or_free_delta, min, max)`, and is not a sensor model. Unknown cells are `None`. A stored `0.0` in ray mode is an observed value. `log_odds_to_probability` is for use outside ingestion.
+
+The grid is infinite and addressed with signed voxels. Chunks are 16³ cells by default (`PointSceneWriter<Cell, SIDE>` can be built at 8 or 32). Sparse chunks promote to a dense array at `promotion_threshold` (default 256). `div_euclid` maps negative voxels into chunks. Coordinates that are non-finite or not exactly representable as a voxel index are counted invalid and are not saturated to an extreme key.
+
+`RangeFilter` compares squared sensor-to-hit distance, inclusive, with no square root. Point mode applies it only in `insert_points_from_source`. A rejected hit rejects the whole ray and writes no voxels. `max_chunks` and `max_cells_per_ray` reject an observation before mutating it. `None` for the ray cap still stops at `ABSOLUTE_MAX_CELLS_PER_RAY` so a ray cannot run forever. The default cap is `DEFAULT_MAX_CELLS_PER_RAY` (1_048_576). The bound is the Manhattan voxel distance plus one, so a configured cap can reject a shorter ray.
+
+`publish` copies only dirty chunks into `Arc` snapshots, then updates the reader index under one write lock. `snapshot_region`, `snapshot_chunks`, and `snapshot_all` copy those handles under one read lock and record one generation. `snapshot_all` is proportional to the number of chunks. A snapshot stays immutable after later publishes. `changes_since` returns deduplicated chunk keys for that reader’s cursor. If the cursor is older than the bounded journal, it returns `ChangeHistoryLost`; take a fresh snapshot and continue from `snapshot.generation()`. The journal keeps at least the newest publication even when that publication exceeds the key budget. An empty `publish` does not advance the generation.
+
+The writer map and the latest published chunks can both be resident, and a slow reader can keep older `Arc` chunks alive. `memory_stats` estimates those costs. There is no automatic eviction. Readers never call the ray model. Ray updates run in input order. DDA emits one `Free` event for each positive-length interior cell and exactly one `Hit` on the endpoint voxel, including a zero-length endpoint. Corner and edge touches are not marked free. `ray_length_m` is computed only when `needs_metric_length` returns true.
+
+Examples: `live_points`, `live_rays`, `live_observer`. Host measurements are in `docs/live-benchmarks.md`. ROCK 5T numbers require a measurement on that board.
