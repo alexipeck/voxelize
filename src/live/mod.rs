@@ -5,6 +5,7 @@ mod dda;
 mod error;
 mod geometry;
 mod model;
+mod paired;
 mod point;
 mod published;
 mod ray;
@@ -23,6 +24,10 @@ pub use geometry::{
     ChunkKey, VoxelBounds, VoxelGeometry, VoxelKey, chunk_and_local, voxel_from_chunk,
 };
 pub use model::{LogOddsOccupancy, RayUpdateModel, log_odds_to_probability};
+pub use paired::{
+    COARSE_SIDE, ClearRule, FINE_SIDE, PairedBatchStats, PairedPublishStats, PairedReader,
+    PairedSceneConfig, PairedSceneWriter, PairedSnapshot,
+};
 pub use point::{
     Occupied, PointCell, PointObservation, PointSceneWriter, open_count_scene, open_presence_scene,
 };

@@ -103,11 +103,11 @@ where
         payload.saturating_add(64)
     }
 
-    pub(crate) fn for_each_observed_mut(&mut self, mut f: impl FnMut(&mut Cell)) {
+    pub(crate) fn for_each_observed_mut(&mut self, mut f: impl FnMut(u16, &mut Cell)) {
         match &mut self.body {
             Body::Sparse(entries) => {
-                for (_, cell) in entries.iter_mut() {
-                    f(cell);
+                for (local, cell) in entries.iter_mut() {
+                    f(*local, cell);
                 }
             }
             Body::Dense { values, observed } => {
@@ -116,11 +116,55 @@ where
                     while remaining != 0 {
                         let index = word_index * 64 + remaining.trailing_zeros() as usize;
                         remaining &= remaining - 1;
-                        f(&mut values[index]);
+                        f(index as u16, &mut values[index]);
                     }
                 }
             }
         }
+    }
+
+    pub(crate) fn for_each_observed_local(&self, mut f: impl FnMut(u16)) {
+        match &self.body {
+            Body::Sparse(entries) => {
+                for (local, _) in entries.iter() {
+                    f(*local);
+                }
+            }
+            Body::Dense { observed, .. } => {
+                for (word_index, word) in observed.iter().enumerate() {
+                    let mut remaining = *word;
+                    while remaining != 0 {
+                        f((word_index * 64 + remaining.trailing_zeros() as usize) as u16);
+                        remaining &= remaining - 1;
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn remove_local(&mut self, local: u16) -> bool {
+        let removed = match &mut self.body {
+            Body::Sparse(entries) => match entries.binary_search_by_key(&local, |entry| entry.0) {
+                Ok(index) => {
+                    entries.remove(index);
+                    true
+                }
+                Err(_) => false,
+            },
+            Body::Dense { values, observed } => {
+                let index = local as usize;
+                let present = bits::test(observed, index);
+                if present {
+                    observed[index / 64] &= !(1u64 << (index % 64));
+                    values[index] = Cell::default();
+                }
+                present
+            }
+        };
+        if removed {
+            self.observed = self.observed.saturating_sub(1);
+        }
+        removed
     }
 
     pub(crate) fn to_published(&self, side: u16) -> PublishedChunk<Cell> {
@@ -334,14 +378,14 @@ mod tests {
         chunk.with_local(5, 0, |cell, _| *cell += 1);
         chunk.with_local(9, 0, |cell, _| *cell += 2);
         let mut sparse = Vec::new();
-        chunk.for_each_observed_mut(|cell| sparse.push(*cell));
+        chunk.for_each_observed_mut(|_, cell| sparse.push(*cell));
         sparse.sort_unstable();
         assert_eq!(sparse, vec![1, 2]);
         assert!(!chunk.is_dense());
         chunk.with_local(300, 0, |cell, _| *cell += 3);
         assert!(chunk.is_dense());
         let mut dense = Vec::new();
-        chunk.for_each_observed_mut(|cell| {
+        chunk.for_each_observed_mut(|_, cell| {
             dense.push(*cell);
             *cell *= 10;
         });
@@ -349,6 +393,29 @@ mod tests {
         assert_eq!(dense, vec![1, 2, 3]);
         assert_eq!(chunk.get(300), Some(30));
         assert_eq!(chunk.get(6), None);
+    }
+
+    #[test]
+    fn removes_cells_sparse_and_dense() {
+        let mut chunk = WorkingChunk::<u16, 8>::new(3);
+        chunk.with_local(5, 0, |cell, _| *cell = 7);
+        assert!(chunk.remove_local(5));
+        assert!(!chunk.remove_local(5));
+        assert_eq!(chunk.get(5), None);
+        for local in [1u16, 2, 3, 300] {
+            chunk.with_local(local, 0, |cell, _| *cell = local);
+        }
+        assert!(chunk.is_dense());
+        assert!(chunk.remove_local(300));
+        assert!(!chunk.remove_local(300));
+        assert_eq!(chunk.get(300), None);
+        let mut locals = Vec::new();
+        chunk.for_each_observed_local(|local| locals.push(local));
+        assert_eq!(locals, vec![1, 2, 3]);
+        chunk.with_local(300, 9, |cell, newly| {
+            assert!(newly);
+            assert_eq!(*cell, 9);
+        });
     }
 
     #[test]

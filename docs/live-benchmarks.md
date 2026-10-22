@@ -99,6 +99,17 @@ Two u32 votes per voxel (`--model votes`), except where noted.
 
 Every pass dirties nearly every chunk in view, whatever its point count, so publish cost per second grows with pass rate. The p99 outliers in the first two rows (39 ms and 28 ms) were not reproduced in the other runs and are worth checking on the board. Images of the scene are in `docs/images/test-scene/` (`cargo run --release --example scene_render`).
 
+## Build flags and paired maps (0.2 m coarse, upper hemisphere, `bench_scan`, 8 s)
+
+| build | case | ingest ms per pass (p50) | M cell updates/s | publish p50 ms |
+|---|---|---|---|---|
+| default release | `--mode rays --model votes --decay exp:0.7` | 243.5–244.5 | 74.1–74.2 | 1.1 |
+| default release | `--mode paired --decay exp:0.7 --clear 0.25:1` | 204–205 | 86.5–86.6 | 7.2 |
+| fat LTO, 1 codegen unit | `--mode rays --model votes --decay exp:0.7` | 207–208 | 87.3 | 1.1 |
+| fat LTO, 1 codegen unit | `--mode paired --decay exp:0.7 --clear 0.25:1` | 210–211 | 81.5–84.3 | 7.2 |
+
+Generic library code is compiled in the crate that uses it. In the default build, the example's own instantiation of the ray path is about 15% slower than the library's (the paired writer instantiates it inside the library). With fat LTO both are equal. Results quoted elsewhere in this file come from the default build, so their ray rates are about 15% pessimistic. Paired maps add about 1–2% to ingest and about 6 ms per publish (see the plan, D14).
+
 ## Micro cases (`bench_live`)
 
 Re-run at `858a388`. Earlier copies of this file named `9b3c2c3` plus uncommitted work; the rates below match those within run-to-run noise.

@@ -60,6 +60,10 @@ impl<M: RayUpdateModel, const SIDE: usize> RaySceneWriter<M, SIDE> {
         &mut self.model
     }
 
+    pub(crate) fn parts_mut(&mut self) -> (&mut ChunkStore<M::Cell, SIDE>, &mut DirtySet, &mut M) {
+        (&mut self.store, &mut self.dirty, &mut self.model)
+    }
+
     pub fn insert_ray(&mut self, ray: RayObservation) -> Result<InsertStats, LiveError> {
         let mut stats = BatchStats {
             input: 1,

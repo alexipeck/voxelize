@@ -186,3 +186,56 @@ Continuation of the 23:33 entry on 2026-10-21.
 
 - **decision** — The user asked to "Commit the working tree changes with a sensible message." Everything from the session goes in as one commit on `live`: library votes and decay, example harnesses and studies, the board script, docs, images, legend and this ledger. Chat transcripts stay out (their folder is git-ignored).
 - **test** — Before committing: fmt, clippy `-D warnings`, `cargo +1.95.0 check --all-targets`, 48 unit + 1 integration tests and `bash -n scripts/bench_board.sh` all pass. All untracked files' modification times match edits made in this session.
+- **deviation** — Pushing `live` (37f832a) from this session failed for lack of credentials. Over HTTPS there is no stored GitHub login and no `gh`. Over SSH, GitHub rejected `~/.ssh/id_ed25519` with "Permission denied (publickey)". The key may not be registered, or may need a passphrase the agent hasn't loaded. The user is to push from their own terminal; no credentials were entered or configured here.
+
+### 14:55 · Idea: dual-resolution maps with cheap derivatives
+`session b8a64a31` · `live` @ `37f832a` · [transcript](transcripts/2026-10-21--b8a64a31.jsonl)
+
+Continuation of the 14:46 entry above.
+
+- **note** — The user proposed running two maps:
+  - a coarse ray map (about 0.2 m) with votes, as discussed;
+  - a fine map at half the voxel size (8× the cells), tracking hit membership only, without DDA, as a high-resolution no-go map;
+  - a derivative of both that weights the 8 fine voxels inside each coarse voxel.
+  Planning would run on the coarse map. The goal is computationally cheap derivatives.
+- **test** — Cost of the fine hit-only map, measured on the host (hemisphere sensor, 8 s): point presence at 0.1 m, chunk side 32, versus the coarse vote ray map at 0.2 m, side 16.
+  - evidence: fine presence takes 2.7 ms per 230k-point pass at max rate (86 M points/s) and 10.5 ms per pass when paced at 2.3 M/s (the host is slower when idle between passes). Publish 0.2–0.7 ms. 745k hit voxels take 2.1 MB after 8 s paced.
+  - evidence: the coarse ray map takes 241 ms per pass (0.96 M rays/s). At max rate, the fine map adds about 1% to the coarse map's work.
+  - evidence: at 0.1 m, presence with chunk side 32 is 2.5× faster than side 16 (86 vs 35 M points/s).
+- **claim** — Same grid origin, fine size exactly half the coarse, and fine chunk side 32 against coarse side 16 give identical chunk keys and 3.2 m chunks. The 8 sub-voxels of a coarse voxel are then bits in one paired fine chunk, so per-coarse-voxel masks and weights need no lookups. Risk: the fine map has no misses, so it never forgets; coarse free evidence could be used to clear its bits.
+
+### 16:06 · Paired maps prototype
+`session b8a64a31` · `live` @ `37f832a` · [transcript](transcripts/2026-10-21--b8a64a31.jsonl)
+
+Continuation of the 14:55 entry above.
+
+- **decision** — The user asked to "Prototype the paired maps: a coarse vote ray map and an aligned half-size hit-only map published together under one generation, with the 8-bit sub-voxel mask derivative and clearing of fine hits from coarse free evidence. Measure the cost."
+  - Built `PairedSceneWriter` / `PairedReader` / `PairedSnapshot` / `ClearRule` in `src/live/paired.rs`: coarse `RaySceneWriter<VoteModel,16>` plus fine `PointSceneWriter<Occupied,32>` at half the size and the same origin. Both maps share chunk keys, and one `RwLock` index holds coarse, fine and mask layers with one generation.
+  - Crate-internal helpers added: `WorkingChunk::{for_each_observed_mut(local, cell), for_each_observed_local, remove_local}`, `ChunkStore::{chunk, chunk_mut, forget_cells}`, writer `parts_mut`, `votes::was_updated`, and `PublishedSnapshot::new` made `pub(crate)`. New `LiveError::InvalidClearRule`.
+- **test** — 56 unit tests pass, 8 of them new:
+  - children and parents agree for all 4096 coarse locals;
+  - fine keys divided by 2 equal coarse keys for 4 origins × 4 sizes × 4000 points;
+  - one generation, and masks equal those rebuilt from the fine snapshot;
+  - region bounds are applied at both resolutions;
+  - the range filter applies to both maps;
+  - clearing works with decay and does nothing without it;
+  - `ClearRule` validation;
+  - chunk removal, sparse and dense.
+  fmt, clippy `-D warnings`, MSRV 1.95.0 and the integration test pass.
+- **test** — Unexpected result: in the default release build, paired ingest (204–205 ms per pass) was faster than the coarse map alone (243.5–244.5 ms). With fat LTO and `codegen-units=1`, coarse alone is 207–208 ms and paired 210–211 ms. The ray path is about 15% slower when its generic code is instantiated in the example crate rather than the library. So every earlier ray rate from `bench_scan` (default build) is about 15% pessimistic. `bench_board.sh` now also builds with LTO, and the plan's §7 recommends LTO for applications.
+- **test** — Cost of the paired maps with LTO (host, 0.2/0.1 m, hemisphere): ingest +1–2%, publish 7.2 ms vs 1.1 ms (fine copies plus masks about 3 ms, decay plus clearing about 3 ms), about 4% more CPU overall; memory +10% working, +15% published. The first clearing loop tried 8 children for every free coarse voxel and took 9.5–10.4 ms per publish. The current loop walks only existing fine voxels and checks their parents; `paired_study` results are identical.
+- **test** — `paired_study` (coarse 0.2 m, hover, box removed after 20 passes).
+  - evidence: keep 0.7 with clear (0.25, 1) clears half the box's 2081 fine voxels in 13 passes; 406 are left after 60.
+  - evidence: 93 of the leftovers share a coarse voxel with a real surface, so they cannot be cleared through the coarse map. This is a structural limit.
+  - evidence: real fine voxels present after the removal average 99.2–99.9%; surfaces hit only intermittently are cleared and re-added.
+  - evidence: no decay means no clearing. keep 0.9 clears half in 47–53 passes.
+- **decision** — Plan revision (j) adds D14 with cost and behaviour tables; README, benchmark doc and legend (Paired maps, Sub-voxel mask, Clear rule) are updated. Nothing committed.
+
+### 17:01 · Commit of the paired-maps prototype
+`session b8a64a31` · `live` @ `37f832a` · [transcript](transcripts/2026-10-21--b8a64a31.jsonl)
+
+Continuation of the 16:06 entry above.
+
+- **note** — The user pushed 37f832a themselves; `live` matched `origin/live` before this commit.
+- **decision** — The user asked to "Commit the working tree changes with a sensible message." The paired-maps prototype goes in as one commit on `live`: library, bench mode, study, board script cases, docs, legend and ledger. Not pushed.
+- **test** — Before committing: fmt, clippy `-D warnings`, `cargo +1.95.0 check --all-targets`, 56 unit + 1 integration tests and `bash -n scripts/bench_board.sh` pass. All changed files were last modified by 16:06, matching this session's edits. `examples/export_passes.rs` and `examples/vote_order_study.rs` were flagged as changed but have no diff from HEAD.

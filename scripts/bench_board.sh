@@ -19,7 +19,7 @@
 #   parallel.txt combined rate of the 2- and 4-scene runs
 #
 # Needs a Rust toolchain on the board. Builds a generic binary and one tuned with
-# -C target-cpu=cortex-a76, and compares them on one case.
+# -C target-cpu=cortex-a76 and one with fat LTO, and compares them.
 set -euo pipefail
 
 seconds=30
@@ -140,8 +140,13 @@ echo "building"
 cargo build --release --example bench_scan --example bench_live
 CARGO_TARGET_DIR=target/cortex-a76 RUSTFLAGS="-C target-cpu=cortex-a76" \
     cargo build --release --example bench_scan
+# Generic code from the library is compiled in the example's own crate; whole-program
+# optimisation changed ray throughput by about 15% on the host, so compare it here too.
+CARGO_TARGET_DIR=target/lto CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
+    cargo build --release --example bench_scan
 generic=target/release/examples/bench_scan
 tuned=target/cortex-a76/release/examples/bench_scan
+lto=target/lto/release/examples/bench_scan
 
 "$generic" --table-header >"$out/summary.md"
 
@@ -234,6 +239,13 @@ if [[ -n $little && $little != "$cores" ]]; then
 fi
 run_parallel 2 rays-max-hemisphere-x2 "$generic" "${hemisphere[@]}"
 run_parallel 4 rays-max-hemisphere-x4 "$generic" "${hemisphere[@]}"
+
+# Whole-program optimisation, and the paired coarse-ray plus half-size hit maps.
+run rays-max-hemisphere-lto "$lto" "${hemisphere[@]}"
+paired=(--mode paired --decay exp:0.7 --clear 0.25:1 --elevation-min 0 --elevation-max 90)
+run paired-max "$generic" "${paired[@]}"
+run paired-max-lto "$lto" "${paired[@]}"
+run paired-paced-lto "$lto" "${paired[@]}" --paced
 
 # Sustained run for thermal throttling; compare its rate with rays-max.
 per_case=$seconds

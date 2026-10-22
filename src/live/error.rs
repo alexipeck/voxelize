@@ -22,6 +22,8 @@ pub enum LiveError {
     InvalidBlockedRule,
     #[error("vote decay needs 0 < keep < 1 or a cap of at least one vote")]
     InvalidVoteDecay,
+    #[error("clear rule needs finite, non-negative vote limits")]
+    InvalidClearRule,
     #[error("coordinate is not a finite representable voxel index")]
     InvalidCoordinate,
     #[error("sensor-to-hit distance is not finite")]

@@ -1,6 +1,6 @@
 # Voxelize live scene: specification and plan
 
-**Revision 2026-10-21 (i).** Replaces the 2026-10-20 "High-Throughput Live Voxel Scene Implementation Plan". The `live` branch implements §2–§7, except where §2.6 and §8 say a change is pending. §8 lists the decisions, both made and open, and §9 is the work that follows them.
+**Revision 2026-10-22 (j).** Replaces the 2026-10-20 "High-Throughput Live Voxel Scene Implementation Plan". The `live` branch implements §2–§7, except where §2.6 and §8 say a change is pending. §8 lists the decisions, both made and open, and §9 is the work that follows them.
 
 Decided so far:
 
@@ -198,9 +198,11 @@ The check costs one snapshot lookup per corridor voxel. A 50 m path at 0.25 m is
   - `ray_modes_study` and `vote_order_study`: compare ray semantics cell by cell, for §8.
   - `scene_render`: renders the synthetic warehouse and the vote map into `docs/images/test-scene/`. The map is drawn as blocked voxels (`--blocked-share`, `--min-hits`), as hit share (a probability colour scale) in 3D and in slices, at `--voxel` (default 0.2 m). The warehouse is analytic geometry; the simulated sensor is ray-cast against it to produce the test point clouds.
   - `decay_study`: how fast each decay mode clears a removed obstacle, and what it keeps (D7).
+  - `paired_study`: how fast coarse free evidence clears the fine hit map after an obstacle leaves (D14).
   - `export_passes`: writes the synthetic data as one PLY point cloud per 100 ms pass (hit, sensor origin at fire time, time in pass), plus a `passes.csv` index.
   - On the board, `scripts/bench_board.sh` runs the `bench_scan` matrix pinned to the A76 cores. It records the board, kernel, compiler, governors, clocks and temperatures, plus a soak run, and compares a generic build with a `-C target-cpu=cortex-a76` build.
 - **What a performance claim includes:** commit, board, build flags, pinning, voxel size, range, mean and p95 cells per ray, chunk side and model.
+- **Build flags matter:** the library's generic code is compiled in the calling crate. Fat LTO with one codegen unit made the same ray workload about 15% faster on the host (207–211 ms instead of 243–245 ms per pass at 0.2 m). Applications SHOULD build release with `lto = "fat"` and `codegen-units = 1`, and benchmarks SHOULD report both builds. `bench_board.sh` builds both.
 - **Headline figures:**
   - paced at 2.3 M/s: writer busy (one-core equivalents) and late scans;
   - max rate: input/s and cell updates/s;
@@ -224,6 +226,7 @@ The check costs one snapshot lookup per corridor voxel. A 50 m path at 0.25 m is
 | D11 | Free-space carving range | New opt-in lever: about 1.6× at 10 m in the warehouse |
 | D12 | What a per-pass publish copies | Each pass dirties the whole view. Under 1 ms per pass at 0.2–0.25 m; it matters at 0.1 m or with fast sensors |
 | D13 | GPU ingestion (OpenCL, Mali-G610, unified memory) | Parked: the CPU handles DDA well. Kept in reserve if compute becomes a constraint |
+| D14 | Paired maps: coarse vote rays plus a half-size hit-only map | Prototyped (`PairedSceneWriter`): one generation, 8-bit sub-voxel masks, clearing from coarse free evidence. About 4% more CPU than the coarse map alone |
 
 **Votes and order (`vote_order_study`,** 10 scans, about 2.2 M exact rays, 40 m range). "Surface cells left free" is the share of voxels that hold a return but end up free, which is false free space for a planner.
 
@@ -414,6 +417,57 @@ Recommendation: start with (a), measure on the board at the real pass rate, and 
   - Check whether OpenCL works on the board's OS image (vendor `libmali`, or Mesa Rusticl with Panfrost/Panthor). `bench_board.sh` records `clinfo` and the GPU driver in `system.txt`.
   - It would need a new dependency (for example `opencl3`) behind a cargo feature, with the CPU path kept as the reference and a test comparing the two maps bit for bit.
 - **Status: parked.** The maintainer has run this DDA on CPUs before and expects them to stay faster for it. The measurements agree that stepping is cheap (about 310 M cells/s on one host core) and the per-voxel store write dominates. The GPU stays in reserve if compute ever becomes the constraint.
+
+**D14 — Paired maps (prototype).** The maintainer's proposal: plan on a coarse vote ray map, and keep a fine hit-only map at half the voxel size as a high-resolution no-go layer. Derive cheap per-voxel products from both.
+
+`PairedSceneWriter` in `src/live/paired.rs`:
+
+- **Two maps:** a coarse `RaySceneWriter<VoteModel, 16>` and a fine `PointSceneWriter<Occupied, 32>` at half the voxel size, with the same origin. Every accepted ray adds its hit to both. The range filter applies to both, and the fine map does no DDA.
+- **Alignment is exact.** Halving the voxel size is exact in binary floating point, so a fine voxel's key divided by 2 (floor) is always its coarse parent's key; a test checks this for several origins and sizes. Chunk side 32 at half the size spans the same 3.2 m (at 0.2 m) as side 16 coarse, so both maps share chunk keys, and a coarse chunk's 4096 voxels hold exactly the 32768 voxels of its fine chunk.
+- **One generation.** `publish()` decays the coarse votes, clears fine voxels, copies the changed chunks of both maps, and builds the 8-bit sub-voxel mask chunks for every changed fine chunk. It then installs all three layers under one write lock and one generation. `PairedReader::snapshot_region` / `snapshot_all` return a `PairedSnapshot` with all three layers at that generation.
+- **Mask:** bit x + 2y + 4z for each hit fine sub-voxel of a coarse voxel. Its population count is the fill fraction, and the bits say where in the voxel the hits are.
+- **Clearing (`ClearRule`):** the fine map has no misses, so it would never forget. A fine voxel is removed at publish when its coarse parent was observed in that pass and, after decay, has at most `max_hit_votes` hits and at least `min_miss_votes` misses. Clearing needs coarse decay: without it, a coarse voxel that was ever hit keeps its hits.
+
+**Cost** (*host*, coarse 0.2 m / fine 0.1 m, upper hemisphere, 2.3 M returns per second, 8 s, two runs; ms per 100 ms pass):
+
+| Build | Map | Ingest p50 | Publish p50 |
+|---|---|---|---|
+| default release | coarse votes only, keep 0.7 | 243.5–244.5 | 1.1 |
+| default release | paired, no decay, no clearing | 204–205 | 4.2–4.3 |
+| default release | paired, keep 0.7, clear (0.25, 1) | 204–205 | 7.2 |
+| fat LTO, 1 codegen unit | coarse votes only, keep 0.7 | 207–208 | 1.1 |
+| fat LTO, 1 codegen unit | paired, keep 0.7, clear (0.25, 1) | 210–211 | 7.2 |
+
+What the table shows:
+
+- **Compare like builds.** In the default build, the coarse map alone is slower than the paired maps. Its generic ray code is instantiated in the example crate rather than the library, and it optimises worse there (see §7).
+- **With LTO, the paired maps add** about 1–2% to ingest and about 6 ms to each publish. That is roughly 4% more CPU than the coarse map alone.
+- **Memory** grows by about 10% working and 15% published (fine hits plus masks).
+- **Publish cost by part:** fine copies plus mask building take about 3 ms. Decay plus clearing take about 3 ms.
+- **An earlier clearing loop** tried all 8 children of every free coarse voxel and took about 10 ms. The current one walks only the fine voxels that exist and checks their parents.
+
+**Behaviour** (`examples/paired_study.rs`, coarse 0.2 m, hovering sensor). A 1 × 1 × 1.5 m box, repeated every 12 m, is watched for 20 passes, then removed and watched for 60 more. Box voxels are the fine voxels with no hits when the box is absent.
+
+| Decay | Clear (max hit, min miss votes) | Box fine voxels at removal | Passes until half clear | Left at end | Of those, sharing a coarse voxel with a real surface | Real fine voxels present after removal (mean / min) |
+|---|---|---|---|---|---|---|
+| none | 0.25, 1 | 2082 | > 60 | 2082 | 93 | 100% / 100% |
+| keep 0.9 | 0.25, 1 | 2082 | 53 | 880 | 93 | 99.9% / 99.9% |
+| keep 0.9 | 0.5, 1 | 2082 | 47 | 436 | 93 | 99.9% / 99.8% |
+| keep 0.7 | 0.25, 1 | 2081 | 13 | 406 | 93 | 99.5% / 99.4% |
+| keep 0.7 | 0.5, 1 | 2079 | 11 | 405 | 93 | 99.2% / 99.1% |
+| cap 200 | 0.25, 1 | 2082 | 19 | 985 | 93 | 100% / 100% |
+
+What the table shows:
+
+- **Clearing works,** but it is limited by the coarse voxel. A fine voxel cannot be cleared while its coarse parent still holds real surface; here that is 93 fine voxels, mostly floor next to the box.
+- **The other leftovers** are in coarse voxels that rays cross too rarely to reach the miss threshold.
+- **Surfaces still present flicker slightly.** A distant floor voxel that is hit only intermittently is cleared and later re-added. 99.1–99.9% of real fine voxels are present at any moment after the removal.
+- **Not done in the prototype:**
+  - per-sub-voxel weights that combine the mask with coarse votes (the reader can compute them from one snapshot);
+  - incremental mask updates (masks are rebuilt per changed fine chunk);
+  - a voxel size other than half;
+  - `wait_for_generation`;
+  - chunk deletion.
 
 ## 9. Work plan
 

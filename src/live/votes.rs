@@ -43,6 +43,10 @@ impl Votes {
     }
 }
 
+pub(crate) fn was_updated(votes: &Votes) -> bool {
+    votes.misses & UPDATED != 0
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum VoteDecay {
     #[default]

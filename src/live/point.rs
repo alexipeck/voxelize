@@ -134,6 +134,10 @@ impl<Cell: PointCell, const SIDE: usize> PointSceneWriter<Cell, SIDE> {
         })
     }
 
+    pub(crate) fn parts_mut(&mut self) -> (&mut ChunkStore<Cell, SIDE>, &mut DirtySet) {
+        (&mut self.store, &mut self.dirty)
+    }
+
     pub fn observed_cells(&self) -> u64 {
         self.store.observed_cells()
     }

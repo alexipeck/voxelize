@@ -98,9 +98,23 @@ where
     ) {
         for key in keys {
             if let Some(&slot) = self.index.get(&key) {
-                self.slots[slot as usize].for_each_observed_mut(&mut f);
+                self.slots[slot as usize].for_each_observed_mut(|_, cell| f(cell));
             }
         }
+    }
+
+    pub(crate) fn chunk_mut(&mut self, key: ChunkKey) -> Option<&mut WorkingChunk<Cell, SIDE>> {
+        let slot = *self.index.get(&key)?;
+        Some(&mut self.slots[slot as usize])
+    }
+
+    pub(crate) fn chunk(&self, key: ChunkKey) -> Option<&WorkingChunk<Cell, SIDE>> {
+        let slot = *self.index.get(&key)?;
+        Some(&self.slots[slot as usize])
+    }
+
+    pub(crate) fn forget_cells(&mut self, count: u64) {
+        self.observed_cells = self.observed_cells.saturating_sub(count);
     }
 
     pub(crate) fn chunk_count(&self) -> u64 {

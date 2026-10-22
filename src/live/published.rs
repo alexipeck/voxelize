@@ -382,7 +382,7 @@ pub struct PublishedSnapshot<Cell> {
 }
 
 impl<Cell> PublishedSnapshot<Cell> {
-    fn new(
+    pub(crate) fn new(
         generation: u64,
         published_at: Option<Instant>,
         mut chunks: Vec<ChunkHandle<Cell>>,

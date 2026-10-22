@@ -19,10 +19,10 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use voxelaz::live::{
-    BatchStats, LogOddsOccupancy, Occupied, PointCell, PointSceneConfig, PointSceneWriter,
-    PublishStats, RayCellContext, RayCellRole, RayObservation, RaySceneConfig, RaySceneWriter,
-    RayUpdateModel, SceneMemoryStats, SceneReader, VoteDecay, VoteModel, VoxelBounds,
-    VoxelGeometry, VoxelKey, visit_ray,
+    BatchStats, COARSE_SIDE, ClearRule, LogOddsOccupancy, Occupied, PairedSceneConfig,
+    PairedSceneWriter, PointCell, PointSceneConfig, PointSceneWriter, PublishStats, RayCellContext,
+    RayCellRole, RayObservation, RaySceneConfig, RaySceneWriter, RayUpdateModel, SceneMemoryStats,
+    SceneReader, VoteDecay, VoteModel, Votes, VoxelBounds, VoxelGeometry, VoxelKey, visit_ray,
 };
 
 use scene::{Lcg, Lidar, PERIOD_M, Scan, Warehouse};
@@ -37,6 +37,8 @@ enum Mode {
     Rays,
     /// Rays from a source that moves during the scan, one source per return.
     RaysMoving,
+    /// Vote rays at --voxel plus a half-size hit-only map, published together.
+    Paired,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -99,6 +101,10 @@ struct Args {
     /// Decay for --model votes, applied at each publish: none, exp:<keep> or cap:<votes>.
     #[arg(long, default_value = "none", value_parser = parse_decay)]
     decay: VoteDecay,
+    /// For --mode paired: clear fine hits once their coarse voxel, decayed at publish, has
+    /// at most <hits> and at least <misses> votes ("hits:misses"), or "none".
+    #[arg(long, default_value = "0.25:1", value_parser = parse_clear)]
+    clear: Clear,
     #[arg(long, value_enum, default_value_t = Observer::None)]
     observer: Observer,
     #[arg(long, default_value_t = 5.0)]
@@ -144,27 +150,46 @@ fn by_side<const SIDE: usize>(args: &Args, geometry: VoxelGeometry) {
         (Mode::Presence, _) => {
             let (writer, reader) =
                 PointSceneWriter::<Occupied, SIDE>::open(geometry, &points).unwrap();
-            bench(args, geometry, writer, reader);
+            bench(args, geometry, writer, Some(reader));
         }
         (Mode::Count, _) => {
             let (writer, reader) = PointSceneWriter::<u16, SIDE>::open(geometry, &points).unwrap();
-            bench(args, geometry, writer, reader);
+            bench(args, geometry, writer, Some(reader));
         }
         (Mode::Rays | Mode::RaysMoving, Model::LogOdds) => {
             let (writer, reader) =
                 RaySceneWriter::<_, SIDE>::open(geometry, &rays, LogOddsOccupancy::default())
                     .unwrap();
-            bench(args, geometry, writer, reader);
+            bench(args, geometry, writer, Some(reader));
         }
         (Mode::Rays | Mode::RaysMoving, Model::Evidence) => {
             let (writer, reader) =
                 RaySceneWriter::<_, SIDE>::open(geometry, &rays, EvidenceModel).unwrap();
-            bench(args, geometry, writer, reader);
+            bench(args, geometry, writer, Some(reader));
         }
         (Mode::Rays | Mode::RaysMoving, Model::Votes) => {
             let model = VoteModel::new(args.decay).expect("decay");
             let (writer, reader) = RaySceneWriter::<_, SIDE>::open(geometry, &rays, model).unwrap();
-            bench(args, geometry, writer, reader);
+            bench(args, geometry, writer, Some(reader));
+        }
+        (Mode::Paired, _) => {
+            assert_eq!(
+                SIDE, COARSE_SIDE,
+                "paired maps use coarse chunk side {COARSE_SIDE}"
+            );
+            let config = PairedSceneConfig {
+                clear: args.clear.0,
+                ..PairedSceneConfig::default()
+            };
+            let model = VoteModel::new(args.decay).expect("decay");
+            let (writer, _) = PairedSceneWriter::open(geometry, &config, model).unwrap();
+            let sink = PairedSink {
+                writer,
+                cleared: 0,
+                fine_chunks: 0,
+                publishes: 0,
+            };
+            bench(args, geometry, sink, None::<SceneReader<Votes>>);
         }
     }
 }
@@ -201,6 +226,51 @@ trait Sink {
     fn ingest(&mut self, batch: &Batch) -> BatchStats;
     fn publish(&mut self) -> PublishStats;
     fn memory(&self) -> SceneMemoryStats;
+
+    fn extra(&self) -> Option<String> {
+        None
+    }
+}
+
+struct PairedSink {
+    writer: PairedSceneWriter,
+    cleared: u64,
+    fine_chunks: u64,
+    publishes: u64,
+}
+
+impl Sink for PairedSink {
+    fn ingest(&mut self, batch: &Batch) -> BatchStats {
+        if batch.rays.is_empty() {
+            self.writer
+                .insert_rays_from_source(batch.source, &batch.hits)
+        } else {
+            self.writer.insert_rays(&batch.rays)
+        }
+        .expect("paired batch")
+        .coarse
+    }
+
+    fn publish(&mut self) -> PublishStats {
+        let stats = self.writer.publish().expect("publish");
+        self.cleared += stats.fine_cleared;
+        self.fine_chunks += stats.fine_chunks;
+        self.publishes += 1;
+        stats.publish
+    }
+
+    fn memory(&self) -> SceneMemoryStats {
+        self.writer.memory_stats()
+    }
+
+    fn extra(&self) -> Option<String> {
+        Some(format!(
+            "paired fine_voxel_m={} fine_chunks_per_publish={:.0} fine_voxels_cleared={}",
+            self.writer.fine_geometry().voxel_size(),
+            self.fine_chunks as f64 / self.publishes.max(1) as f64,
+            self.cleared
+        ))
+    }
 }
 
 impl<Cell: PointCell, const SIDE: usize> Sink for PointSceneWriter<Cell, SIDE> {
@@ -260,7 +330,7 @@ fn bench<W: Sink, C: Copy + Send + Sync + 'static>(
     args: &Args,
     geometry: VoxelGeometry,
     mut writer: W,
-    reader: SceneReader<C>,
+    reader: Option<SceneReader<C>>,
 ) {
     let world = Warehouse::new(args.seed);
     let cast_speed = if args.speed > 0.0 { args.speed } else { 4.0 };
@@ -280,7 +350,7 @@ fn bench<W: Sink, C: Copy + Send + Sync + 'static>(
     let cast_s = cast_started.elapsed().as_secs_f64();
     let returns_per_scan =
         scans.iter().map(|scan| scan.offsets.len()).sum::<usize>() as f64 / scans.len() as f64;
-    let rays = matches!(args.mode, Mode::Rays | Mode::RaysMoving);
+    let rays = matches!(args.mode, Mode::Rays | Mode::RaysMoving | Mode::Paired);
     let cells = rays.then(|| cells_per_ray(&geometry, &scans[0]));
 
     let replay = Replay {
@@ -302,7 +372,7 @@ fn bench<W: Sink, C: Copy + Send + Sync + 'static>(
         })
     };
     let observer = (args.observer != Observer::None).then(|| {
-        let reader = reader.clone();
+        let reader = reader.clone().expect("--observer needs a single scene");
         let stop = Arc::clone(&stop);
         let pose = Arc::clone(&pose);
         let plan = ObserverPlan {
@@ -321,6 +391,9 @@ fn bench<W: Sink, C: Copy + Send + Sync + 'static>(
     let producer_cpu = producer.join().expect("producer");
     let observed = observer.map(|handle| handle.join().expect("observer"));
     let memory = writer.memory();
+    if let Some(extra) = writer.extra() {
+        println!("{extra}");
+    }
     report(
         args,
         &lidar,
@@ -333,6 +406,28 @@ fn bench<W: Sink, C: Copy + Send + Sync + 'static>(
         observed.as_ref(),
         &memory,
     );
+}
+
+/// The --clear setting; a newtype so clap does not treat it as an optional argument.
+#[derive(Clone, Copy, Debug)]
+struct Clear(Option<ClearRule>);
+
+/// Parses `none` or `<hits>:<misses>`.
+fn parse_clear(text: &str) -> Result<Clear, String> {
+    if text == "none" {
+        return Ok(Clear(None));
+    }
+    let (hits, misses) = text
+        .split_once(':')
+        .ok_or_else(|| format!("clear must be none or <hits>:<misses>, not {text}"))?;
+    let parse = |value: &str| {
+        value
+            .parse::<f64>()
+            .map_err(|_| format!("bad number {value}"))
+    };
+    ClearRule::new(parse(hits)?, parse(misses)?)
+        .map(|rule| Clear(Some(rule)))
+        .map_err(|error| error.to_string())
 }
 
 /// Parses `none`, `exp:0.9` or `cap:1000`.
