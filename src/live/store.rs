@@ -91,6 +91,18 @@ where
         }
     }
 
+    pub(crate) fn end_pass(
+        &mut self,
+        keys: impl Iterator<Item = ChunkKey>,
+        mut f: impl FnMut(&mut Cell),
+    ) {
+        for key in keys {
+            if let Some(&slot) = self.index.get(&key) {
+                self.slots[slot as usize].for_each_observed_mut(&mut f);
+            }
+        }
+    }
+
     pub(crate) fn chunk_count(&self) -> u64 {
         self.slots.len() as u64
     }

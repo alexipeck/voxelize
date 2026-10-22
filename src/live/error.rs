@@ -16,6 +16,12 @@ pub enum LiveError {
     InvalidPromotionThreshold,
     #[error("log-odds limits must be finite with min <= max")]
     InvalidModel,
+    #[error(
+        "blocked rule needs a finite minimum hit count of at least 0 and a hit share between 0 and 1"
+    )]
+    InvalidBlockedRule,
+    #[error("vote decay needs 0 < keep < 1 or a cap of at least one vote")]
+    InvalidVoteDecay,
     #[error("coordinate is not a finite representable voxel index")]
     InvalidCoordinate,
     #[error("sensor-to-hit distance is not finite")]
@@ -30,7 +36,7 @@ pub enum LiveError {
     GenerationOverflow,
     #[error("dirty chunk disappeared before publication")]
     MissingDirtyChunk,
-    #[error("ray traversal failed ({stats:?})")]
+    #[error("ray traversal broke an internal invariant; the ray may be partly applied ({stats:?})")]
     TraversalFailed { stats: BatchStats },
     #[error("live scene update was only partially applied ({stats:?})")]
     PartialUpdate { stats: BatchStats },

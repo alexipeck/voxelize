@@ -103,6 +103,26 @@ where
         payload.saturating_add(64)
     }
 
+    pub(crate) fn for_each_observed_mut(&mut self, mut f: impl FnMut(&mut Cell)) {
+        match &mut self.body {
+            Body::Sparse(entries) => {
+                for (_, cell) in entries.iter_mut() {
+                    f(cell);
+                }
+            }
+            Body::Dense { values, observed } => {
+                for (word_index, word) in observed.iter().enumerate() {
+                    let mut remaining = *word;
+                    while remaining != 0 {
+                        let index = word_index * 64 + remaining.trailing_zeros() as usize;
+                        remaining &= remaining - 1;
+                        f(&mut values[index]);
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn to_published(&self, side: u16) -> PublishedChunk<Cell> {
         let body = match &self.body {
             Body::Sparse(entries) => PublishedBody::Sparse(Arc::from(entries.as_slice())),
@@ -306,6 +326,29 @@ mod tests {
         assert_eq!(iterated.len(), 4);
         assert_eq!(iterated, expected);
         assert!(iterated.contains(&(voxel_from_chunk(chunk_key, 400, 16), 1)));
+    }
+
+    #[test]
+    fn visits_every_observed_cell_across_promotion() {
+        let mut chunk = WorkingChunk::<u16, 8>::new(3);
+        chunk.with_local(5, 0, |cell, _| *cell += 1);
+        chunk.with_local(9, 0, |cell, _| *cell += 2);
+        let mut sparse = Vec::new();
+        chunk.for_each_observed_mut(|cell| sparse.push(*cell));
+        sparse.sort_unstable();
+        assert_eq!(sparse, vec![1, 2]);
+        assert!(!chunk.is_dense());
+        chunk.with_local(300, 0, |cell, _| *cell += 3);
+        assert!(chunk.is_dense());
+        let mut dense = Vec::new();
+        chunk.for_each_observed_mut(|cell| {
+            dense.push(*cell);
+            *cell *= 10;
+        });
+        dense.sort_unstable();
+        assert_eq!(dense, vec![1, 2, 3]);
+        assert_eq!(chunk.get(300), Some(30));
+        assert_eq!(chunk.get(6), None);
     }
 
     #[test]

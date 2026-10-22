@@ -21,6 +21,7 @@ pub struct RaySceneWriter<M: RayUpdateModel, const SIDE: usize = 16> {
     range: Option<RangeFilter>,
     max_chunks: Option<u64>,
     cell_cap: u64,
+    pass_end: bool,
     model: M,
     store: ChunkStore<M::Cell, SIDE>,
     dirty: DirtySet,
@@ -36,11 +37,13 @@ impl<M: RayUpdateModel, const SIDE: usize> RaySceneWriter<M, SIDE> {
         config.validate()?;
         let published = Arc::new(PublishedIndex::new(config.journal)?);
         let reader = SceneReader::new(Arc::clone(&published), geometry, SIDE as i64);
+        let pass_end = model.needs_pass_end();
         let writer = Self {
             geometry,
             range: config.range,
             max_chunks: config.max_chunks,
             cell_cap: config.effective_cell_cap(),
+            pass_end,
             model,
             store: ChunkStore::new(config.promotion_threshold),
             dirty: DirtySet::new(),
@@ -98,6 +101,11 @@ impl<M: RayUpdateModel, const SIDE: usize> RaySceneWriter<M, SIDE> {
     }
 
     pub fn publish(&mut self) -> Result<PublishStats, LiveError> {
+        if self.pass_end {
+            let model = &mut self.model;
+            self.store
+                .end_pass(self.dirty.keys(), |cell| model.pass_end(cell));
+        }
         let store = &self.store;
         publish_dirty(&mut self.dirty, &self.published, |key| {
             store.to_published(key).ok_or(LiveError::MissingDirtyChunk)
@@ -219,15 +227,8 @@ impl<M: RayUpdateModel, const SIDE: usize> RaySceneWriter<M, SIDE> {
             return Err(LiveError::PartialUpdate { stats: *stats });
         }
         match walked {
-            Ok(walk) => {
-                if walk.hit_cells != 1 {
-                    return Err(LiveError::TraversalFailed { stats: *stats });
-                }
+            Ok(_) => {
                 stats.accepted += 1;
-                Ok(())
-            }
-            Err(LiveError::InvalidCoordinate) => {
-                stats.invalid += 1;
                 Ok(())
             }
             Err(err) => Err(attach_stats(err, *stats)),

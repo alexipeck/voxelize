@@ -6,7 +6,7 @@ use las::{Header, Point, Writer};
 
 use crate::cancel::CancellationToken;
 use crate::classification::ClassificationFilter;
-use crate::voxel_grid::{VoxelGrid, BOUNDED_QUEUE_CAPACITY, CHUNK_SIZE};
+use crate::voxel_grid::{BOUNDED_QUEUE_CAPACITY, CHUNK_SIZE, VoxelGrid};
 use crate::voxel_point_to_las_point;
 use crate::{Result, VoxelizeError};
 
@@ -34,6 +34,7 @@ fn is_cancelled(cancel: &Option<CancellationToken>) -> bool {
     cancel.as_ref().is_some_and(|t| t.is_cancelled())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_pipeline(
     input: &Path,
     output: PathBuf,
@@ -44,10 +45,7 @@ pub fn run_pipeline(
     classification_filter: ClassificationFilter,
     counts_as_intensity: bool,
     cancel: Option<CancellationToken>,
-) -> (
-    JoinHandle<Result<()>>,
-    JoinHandle<Result<()>>,
-) {
+) -> (JoinHandle<Result<()>>, JoinHandle<Result<()>>) {
     let input = input.to_path_buf();
     let channels = create_channels();
 
@@ -111,7 +109,8 @@ fn run_producer(
         }
 
         let done = buffer.len() < CHUNK_SIZE;
-        a_tx.send(buffer).map_err(|_| VoxelizeError::ConsumerDropped)?;
+        a_tx.send(buffer)
+            .map_err(|_| VoxelizeError::ConsumerDropped)?;
         if done {
             break;
         }
@@ -123,6 +122,7 @@ fn run_producer(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_consumer(
     a_rx: Receiver<Vec<Point>>,
     b_tx: mpsc::Sender<Vec<Point>>,
@@ -148,7 +148,8 @@ fn run_consumer(
                 grid.insert(point.x, point.y, point.z);
             }
         }
-        b_tx.send(buffer).map_err(|_| VoxelizeError::BufferPoolSendFailed)?;
+        b_tx.send(buffer)
+            .map_err(|_| VoxelizeError::BufferPoolSendFailed)?;
     }
 
     drop(b_tx);
@@ -162,7 +163,7 @@ fn run_consumer(
     let mut emitted = 0usize;
     let drain_result = grid.drain(|voxel_point| {
         emitted += 1;
-        if emitted % DRAIN_CANCEL_CHECK_INTERVAL == 0 && is_cancelled(&cancel) {
+        if emitted.is_multiple_of(DRAIN_CANCEL_CHECK_INTERVAL) && is_cancelled(&cancel) {
             return Err(VoxelizeError::Cancelled);
         }
         let point = voxel_point_to_las_point(&voxel_point, &point_format, counts_as_intensity);

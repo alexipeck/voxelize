@@ -60,7 +60,7 @@ pub fn voxelize(input: &Path, output: &Path, config: &VoxelizeConfig) -> Result<
         origin,
         dimensions,
         config.voxel_size,
-        config.classification_filter.clone(),
+        config.classification_filter,
         config.counts_as_intensity,
         config.cancel.clone(),
     );
@@ -89,10 +89,12 @@ pub(crate) fn voxel_point_to_las_point(
     format: &Format,
     counts_as_intensity: bool,
 ) -> Point {
-    let mut point = Point::default();
-    point.x = voxel_point.x;
-    point.y = voxel_point.y;
-    point.z = voxel_point.z;
+    let mut point = Point {
+        x: voxel_point.x,
+        y: voxel_point.y,
+        z: voxel_point.z,
+        ..Point::default()
+    };
     if counts_as_intensity {
         point.intensity = voxel_point.count;
     }

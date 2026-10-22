@@ -1,6 +1,6 @@
+use clap::Parser;
 use std::io::Write;
 use std::path::PathBuf;
-use clap::Parser;
 use voxelaz::{CancellationToken, ClassificationFilter, VoxelizeConfig, VoxelizeError};
 
 #[derive(Parser)]

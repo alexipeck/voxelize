@@ -13,6 +13,12 @@ pub trait RayUpdateModel: Send + 'static {
     fn initial_cell(&self) -> Self::Cell {
         Self::Cell::default()
     }
+
+    fn needs_pass_end(&self) -> bool {
+        false
+    }
+
+    fn pass_end(&mut self, _cell: &mut Self::Cell) {}
 }
 
 #[derive(Clone, Copy, Debug)]

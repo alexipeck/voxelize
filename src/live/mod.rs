@@ -10,6 +10,7 @@ mod published;
 mod ray;
 mod stats;
 mod store;
+mod votes;
 
 pub use chunk::PublishedChunk;
 pub use config::{
@@ -28,3 +29,4 @@ pub use point::{
 pub use published::{Changes, PublishedSnapshot, SceneReader};
 pub use ray::{RayObservation, RaySceneWriter, open_ray_scene};
 pub use stats::{BatchStats, InsertStats, PublishStats, SceneMemoryStats};
+pub use votes::{BlockedRule, VoteDecay, VoteModel, Votes};

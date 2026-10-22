@@ -52,7 +52,15 @@ writer.publish()?;
 assert!(reader.get_voxel_world([0.1, 0.2, 0.3])?.is_some());
 ```
 
-Count mode is `open_count_scene`. Ray mode is `open_ray_scene` with a `RayUpdateModel`. `LogOddsOccupancy` is a reference clamp, `new = clamp(old + hit_or_free_delta, min, max)`, and is not a sensor model. Unknown cells are `None`. A stored `0.0` in ray mode is an observed value. `log_odds_to_probability` is for use outside ingestion.
+Count mode is `open_count_scene`. Ray mode is `open_ray_scene` with a `RayUpdateModel`. `VoteModel` stores `Votes { hits, misses }` per voxel in 8 bytes: one miss for each voxel a ray crosses and one hit for the voxel it ends in.
+
+- **Units:** counts are kept in 1/256 of a vote (`Votes::UNIT`). `Votes::from_votes`, `hit_votes` and `miss_votes` convert. `Votes::hit_share` is hits as a fraction of all votes.
+- **Decay:** `VoteModel::new(VoteDecay)` selects it; `VoteModel::default()` is `VoteDecay::None`.
+  - `Exponential { keep }` multiplies a voxel's counts by `keep`.
+  - `CapHalving { cap_votes }` halves them once their total passes the cap.
+  - Both happen at each `publish`, to voxels updated since the previous publish. Voxels that were not observed are never decayed.
+- **Order and overflow:** the map does not depend on ray order between two publishes. A counter that reaches 2^30 units halves both counts, keeping their ratio.
+- **Blocked rule:** `BlockedRule::new(min_hits, min_hit_share)` decides when a reader treats a voxel as blocked; `min_hits` is in votes and may be fractional. `BlockedRule::any_hit()` blocks on any hit. `is_blocked` uses only an integer shift, multiply and compare. The share is rounded down to 1/65536, which can only block more voxels, never fewer. The writer never applies the rule. `LogOddsOccupancy` is a reference clamp, `new = clamp(old + hit_or_free_delta, min, max)`, and is not a sensor model. Unknown cells are `None`. A stored `0.0` in ray mode is an observed value. `log_odds_to_probability` is for use outside ingestion.
 
 The grid is infinite and addressed with signed voxels. Chunks are 16³ cells by default (`PointSceneWriter<Cell, SIDE>` can be built at 8 or 32). Sparse chunks promote to a dense array at `promotion_threshold` (default 256). `div_euclid` maps negative voxels into chunks. Coordinates that are non-finite or not exactly representable as a voxel index are counted invalid and are not saturated to an extreme key.
 
@@ -62,4 +70,4 @@ The grid is infinite and addressed with signed voxels. Chunks are 16³ cells by 
 
 The writer map and the latest published chunks can both be resident, and a slow reader can keep older `Arc` chunks alive. `memory_stats` estimates those costs. There is no automatic eviction. Readers never call the ray model. Ray updates run in input order. DDA emits one `Free` event for each positive-length interior cell and exactly one `Hit` on the endpoint voxel, including a zero-length endpoint. Corner and edge touches are not marked free. `ray_length_m` is computed only when `needs_metric_length` returns true.
 
-Examples: `live_points`, `live_rays`, `live_observer`. Host measurements are in `docs/live-benchmarks.md`. ROCK 5T numbers require a measurement on that board.
+Examples: `live_points`, `live_rays`, `live_observer`. `bench_scan` replays synthetic LiDAR scans through the writer, and `scripts/bench_board.sh` runs its matrix on the target board. Host measurements are in `docs/live-benchmarks.md`. ROCK 5T numbers require a measurement on that board.

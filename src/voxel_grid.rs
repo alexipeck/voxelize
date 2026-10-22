@@ -60,9 +60,9 @@ impl VoxelGrid {
         } else {
             64 - (max_grid - 1).leading_zeros()
         };
-        let leaf_stride = 1_i64 << ((exponent + 3) / 4);
-        let middle_stride = 1_i64 << ((exponent * 2 + 3) / 4);
-        let top_stride = 1_i64 << ((exponent * 3 + 3) / 4);
+        let leaf_stride = 1_i64 << exponent.div_ceil(4);
+        let middle_stride = 1_i64 << (exponent * 2).div_ceil(4);
+        let top_stride = 1_i64 << (exponent * 3).div_ceil(4);
         let level1_children_per_axis = top_stride / middle_stride;
         let level2_children_per_axis = middle_stride / leaf_stride;
         let level1_len = (level1_children_per_axis
@@ -217,7 +217,12 @@ impl VoxelGrid {
         Ok(())
     }
 
-    fn leaf_insert(leaf: &mut Leaf, voxel_index: usize, leaf_len: usize, counts_as_intensity: bool) {
+    fn leaf_insert(
+        leaf: &mut Leaf,
+        voxel_index: usize,
+        leaf_len: usize,
+        counts_as_intensity: bool,
+    ) {
         if counts_as_intensity {
             Self::leaf_insert_count(leaf, voxel_index, leaf_len);
         } else {
