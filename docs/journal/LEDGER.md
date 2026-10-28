@@ -239,3 +239,24 @@ Continuation of the 16:06 entry above.
 - **note** — The user pushed 37f832a themselves; `live` matched `origin/live` before this commit.
 - **decision** — The user asked to "Commit the working tree changes with a sensible message." The paired-maps prototype goes in as one commit on `live`: library, bench mode, study, board script cases, docs, legend and ledger. Not pushed.
 - **test** — Before committing: fmt, clippy `-D warnings`, `cargo +1.95.0 check --all-targets`, 56 unit + 1 integration tests and `bash -n scripts/bench_board.sh` pass. All changed files were last modified by 16:06, matching this session's edits. `examples/export_passes.rs` and `examples/vote_order_study.rs` were flagged as changed but have no diff from HEAD.
+
+## 2026-10-28
+
+### 18:42 · Scan accumulator prototype and the first ROCK 5T runs
+`session 776d99f4` (run from the UAV repository; its transcript stays there, see `~/projects/UAV/docs/journal/LEDGER.md`, 28 Oct 18:04 to 18:42) · `live` @ `5be47ec`
+
+- **test** — First ROCK 5T runs of `scripts/bench_board.sh` cases, from binaries cross-built on a Mac (the card has no Rust or internet): `bench-results/20261028T212626Z-rock5t` (quick) and `…T213635Z-rock5t` (full), each with the no-build copy of the script and its provenance. One A76: 0.23 M rays/s at 0.2 m, 40 m, band (20.8 M cell events/s, 3.7 times slower than the M4); four scenes on four A76 1.04 M/s together; A55 0.07; no throttling in 600 s; `-C target-cpu=cortex-a76` and fat LTO gave nothing on rays. `docs/live-benchmarks.md` not updated.
+- **test** — Where a ray's time goes, one A76 (`bench-results/20261028-voxsplit`, scratch program over `bench_scan`'s scans): traversal 10.3 ns a cell event, traversal plus a flat hit/miss array 12.1 ns, the writer 50.9 ns. About 38 ns an event is the store path, not memory. A scan makes 20.8 M events on 1.11 M distinct voxels (18.7 each); within 5 m of the sensor 37% of events fall on 2.2% of voxels.
+- **decision** — The user: "Yes, prototype it" (count each scan's events per voxel, write each voxel once, split rays across threads). Built `src/live/scan.rs`: `CountedRayModel` (implemented for `VoteModel` in `votes.rs`), `RaySceneWriter::insert_scan_from_source` and `insert_scan_from_source_threads`, `SCAN_BATCH_RAYS`. `ray.rs`: writer fields `pub(super)`, a `scan` field for the accumulators, `segment_length` and `attach_stats` `pub(super)`. No change to the per-ray path. README, plan D15 and legend (scan accumulator, CountedRayModel) updated.
+- **test** — 3 new tests: maps and statistics equal to per-ray insertion on 1, 3 and 8 threads, for 4 configurations (default, range filter, 40-cell cap with promotion at 1, `max_chunks` fallback) × 3 vote models (none, exponential 0.7, cap 40), with a zero-length ray, a NaN hit and a far ray that uses the spill map; `apply_counts` equal to single updates for 2000 random cases, including starts past 2^30. fmt, clippy `-D warnings`, `cargo +1.95.0 check --all-targets`, 59 unit + 1 integration tests pass.
+- **test** — ROCK 5T A76, 0.2 m, 40 m, 10 scans, map identical to the per-ray writer in every run: band per-ray 50.9 ns an event (0.217 M rays/s), scan 1 thread 24.8 (0.445, 2.0×), 2 threads 14.2, 3 threads 11.1, 4 threads 8.8 (1.26 M rays/s, 5.8×); hemisphere 51.1 / 25.4 / 8.8 ns (0.245 / 0.493 / 1.43 M rays/s). Mac M4: 12.7 / 6.6 / 2.3 ns.
+- **deviation** — My estimate was 3.3× on one thread. On the A76, counting into 16³ blocks found through the chunk table costs 20.1 ns an event against 12.1 for a flat array (Mac 5.1 vs 3.4). Tried and kept: no touched bitset, one contiguous block array, per-cell locals, the last chunk cached (465 vs 499 ms a scan). Tried and dropped: padding blocks by a cache line (no change). A flat array per scan would be faster but grows with the scan's box (about 0.9 GB at 0.2 m for 60 m range); blocks use what is touched (about 26 MB a scan). Merging takes about 38 ms a scan on one thread.
+- **note** — Nothing committed. Backups of the touched files in the UAV session's scratchpad (`backup-voxelize-scan`).
+
+### 18:58 · Commit of the scan accumulator prototype
+`session 776d99f4` · `live` @ `5be47ec`
+
+Continuation of the 18:42 entry above.
+
+- **decision** — The user: "Commit it". The prototype goes in as one commit on `live`: `src/live/scan.rs`, the `votes.rs`, `ray.rs` and `mod.rs` changes, README, plan D15, legend and this ledger. `bench-results/` stays out (untracked). Not pushed.
+- **test** — Before committing: fmt, clippy `-D warnings`, `cargo +1.95.0 check --all-targets`, 59 unit + 1 integration tests pass. The working tree held only this session's changes; `live` matched `origin/live` at 5be47ec.

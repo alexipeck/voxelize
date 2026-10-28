@@ -9,6 +9,7 @@ mod paired;
 mod point;
 mod published;
 mod ray;
+mod scan;
 mod stats;
 mod store;
 mod votes;
@@ -33,5 +34,6 @@ pub use point::{
 };
 pub use published::{Changes, PublishedSnapshot, SceneReader};
 pub use ray::{RayObservation, RaySceneWriter, open_ray_scene};
+pub use scan::{CountedRayModel, SCAN_BATCH_RAYS};
 pub use stats::{BatchStats, InsertStats, PublishStats, SceneMemoryStats};
 pub use votes::{BlockedRule, VoteDecay, VoteModel, Votes};

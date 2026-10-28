@@ -6,6 +6,7 @@ use super::error::LiveError;
 use super::geometry::{VoxelGeometry, chunk_and_local};
 use super::model::RayUpdateModel;
 use super::published::{PublishedIndex, SceneReader, publish_dirty};
+use super::scan::ScanAccumulator;
 use super::stats::{BatchStats, InsertStats, PublishStats, SceneMemoryStats};
 use super::store::{CellTouch, ChunkStore, DirtySet};
 use super::{RangeClass, RangeFilter};
@@ -17,15 +18,17 @@ pub struct RayObservation {
 }
 
 pub struct RaySceneWriter<M: RayUpdateModel, const SIDE: usize = 16> {
-    geometry: VoxelGeometry,
-    range: Option<RangeFilter>,
-    max_chunks: Option<u64>,
-    cell_cap: u64,
+    pub(super) geometry: VoxelGeometry,
+    pub(super) range: Option<RangeFilter>,
+    pub(super) max_chunks: Option<u64>,
+    pub(super) cell_cap: u64,
     pass_end: bool,
-    model: M,
-    store: ChunkStore<M::Cell, SIDE>,
-    dirty: DirtySet,
+    pub(super) model: M,
+    pub(super) store: ChunkStore<M::Cell, SIDE>,
+    pub(super) dirty: DirtySet,
     published: Arc<PublishedIndex<M::Cell>>,
+    // Scan accumulators for `insert_scan_from_source`, one per thread, kept between scans.
+    pub(super) scan: Vec<ScanAccumulator<SIDE>>,
 }
 
 impl<M: RayUpdateModel, const SIDE: usize> RaySceneWriter<M, SIDE> {
@@ -48,6 +51,7 @@ impl<M: RayUpdateModel, const SIDE: usize> RaySceneWriter<M, SIDE> {
             store: ChunkStore::new(config.promotion_threshold),
             dirty: DirtySet::new(),
             published,
+            scan: Vec::new(),
         };
         Ok((writer, reader))
     }
@@ -260,7 +264,7 @@ impl<M: RayUpdateModel, const SIDE: usize> RaySceneWriter<M, SIDE> {
     }
 }
 
-fn segment_length(source: [f64; 3], hit: [f64; 3]) -> Result<f64, LiveError> {
+pub(super) fn segment_length(source: [f64; 3], hit: [f64; 3]) -> Result<f64, LiveError> {
     let dx = hit[0] - source[0];
     let dy = hit[1] - source[1];
     let dz = hit[2] - source[2];
@@ -271,7 +275,7 @@ fn segment_length(source: [f64; 3], hit: [f64; 3]) -> Result<f64, LiveError> {
     Ok(squared.sqrt())
 }
 
-fn attach_stats(err: LiveError, stats: BatchStats) -> LiveError {
+pub(super) fn attach_stats(err: LiveError, stats: BatchStats) -> LiveError {
     match err {
         LiveError::TraversalFailed { .. } => LiveError::TraversalFailed { stats },
         LiveError::PartialUpdate { .. } => LiveError::PartialUpdate { stats },

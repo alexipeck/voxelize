@@ -227,6 +227,7 @@ The check costs one snapshot lookup per corridor voxel. A 50 m path at 0.25 m is
 | D12 | What a per-pass publish copies | Each pass dirties the whole view. Under 1 ms per pass at 0.2–0.25 m; it matters at 0.1 m or with fast sensors |
 | D13 | GPU ingestion (OpenCL, Mali-G610, unified memory) | Parked: the CPU handles DDA well. Kept in reserve if compute becomes a constraint |
 | D14 | Paired maps: coarse vote rays plus a half-size hit-only map | Prototyped (`PairedSceneWriter`): one generation, 8-bit sub-voxel masks, clearing from coarse free evidence. About 4% more CPU than the coarse map alone |
+| D15 | Scan accumulator: count a scan's events per voxel, write each voxel once | Prototyped (`insert_scan_from_source`, `_threads`, `CountedRayModel`): maps and statistics identical to per-ray insertion. ROCK 5T A76, 0.2 m, 40 m: 2.0× on one thread, 5.8× on four (1.26 M rays/s), per-ray 0.217 M rays/s. Counting into chunk blocks costs about 8 ns an event more than a flat array on the A76; merging about 38 ms a scan, serial |
 
 **Votes and order (`vote_order_study`,** 10 scans, about 2.2 M exact rays, 40 m range). "Surface cells left free" is the share of voxels that hold a return but end up free, which is false free space for a planner.
 

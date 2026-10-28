@@ -1,6 +1,7 @@
 use super::dda::{RayCellContext, RayCellRole};
 use super::error::LiveError;
 use super::model::RayUpdateModel;
+use super::scan::CountedRayModel;
 
 const SHARE_BITS: u32 = 16;
 const KEEP_BITS: u32 = 16;
@@ -118,7 +119,8 @@ impl RayUpdateModel for VoteModel {
     type Cell = Votes;
 
     // While decay is on, the top bit of `misses` marks a cell updated since the last
-    // publish. Counts stay below 2^30 plus one vote, so the bit is free, and `pass_end`
+    // publish. Counts stay below 2^30 plus 2^28 (one vote here, at most 2^20 votes in one
+    // `apply_counts`), so the bit is free, and `pass_end`
     // clears it before the chunk is copied, so readers never see it.
     fn update(&mut self, cell: &mut Votes, event: RayCellContext) {
         let mut misses = cell.misses & !UPDATED;
@@ -204,6 +206,24 @@ impl BlockedRule {
     pub fn is_blocked(&self, votes: Votes) -> bool {
         votes.hits >= self.min_hit_units
             && u64::from(votes.hits) << SHARE_BITS >= self.share_fixed * votes.total()
+    }
+}
+
+// The same as `hits` hit and `misses` free calls of `update`, in any order, while no count
+// reaches 2^30 units before the last of them: the halving check runs once, before the
+// counts are added, as `update`'s first call would. A count that crosses 2^30 inside one
+// call is halved at the cell's next update instead of part way through.
+impl CountedRayModel for VoteModel {
+    fn apply_counts(&mut self, cell: &mut Votes, hits: u32, misses: u32) {
+        debug_assert!(hits <= 1 << 20 && misses <= 1 << 20);
+        let mut free = cell.misses & !UPDATED;
+        if cell.hits >= HALVE_AT || free >= HALVE_AT {
+            cell.hits >>= 1;
+            free >>= 1;
+        }
+        cell.hits += hits * Votes::UNIT;
+        free += misses * Votes::UNIT;
+        cell.misses = free | self.updated_flag;
     }
 }
 
